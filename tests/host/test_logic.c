@@ -135,6 +135,7 @@ static void test_value_clamps(void)
 // --- Equivalence with the vendor implementation -------------------------------------------------------------
 // Verbatim logic of process_knob_channel() from the vendor's
 // ESP-IDF/04_Encoder_Test/components/user_encoder_bsp/src/bidi_switch_knob.c (lines 63-87), minus the callback.
+// That file is SPDX-FileCopyrightText: 2016-2024 Espressif Systems (Shanghai) CO LTD, SPDX-License-Identifier: Apache-2.0.
 static int vendor_channel(uint8_t current_level, uint8_t *prev_level, uint8_t *debounce_cnt)
 {
     int fired = 0;
