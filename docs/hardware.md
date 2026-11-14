@@ -203,6 +203,9 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 
 | 2026-11-14 | Plug flipped → ESP32 bridge `1a86:7523` at `/dev/cu.usbserial-10`; flipped back → S3 again (port only listed, never opened) | USB watcher log; user did the flips |
 | 2026-11-14 | `tools/monitor.py` survives unplug/replug: 2 port losses, 2 reconnects, and it ignored the CH340 port while flipped. No boot banner after replug, so the S3 kept running while unplugged; **a battery being fitted is the likely reason (UNVERIFIED)** | `monitor.py 150 --reset none` |
+| 2026-11-14 | **IDF v5.5.6** (CMake 3.30.2 from idf_tools): vendor 08 and 07 rebuilt unmodified (same pin; lock: sh8601 1.0.0, lvgl 8.4.0, cmake_utilities 0.5.3). The only new warnings are 2 Kconfig notices from the 5.3-era sdkconfig. 08 boots with the same log sequence | build logs, `monitor.py` |
+| 2026-11-14 | v5.5.6 08: widgets demo shows correctly; touch switches tabs | user: "yes to both" |
+| 2026-11-14 | v5.5.6 07 loopback: knob clicks audible, louder clockwise; log `vol:` 10→19→12→19→14 | user: "yes to all" + 120 s log |
 
 ## Known quirks in the vendor demo code (for later)
 

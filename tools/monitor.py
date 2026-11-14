@@ -93,12 +93,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-o", "--out", help="also append the raw capture to this file")
     ap.add_argument("--allow-non-espressif", action="store_true",
                     help="allow opening a non-Espressif port (on this board: the ESP32-U4WDH bridge; ask first)")
+    ap.add_argument("--print-port", action="store_true",
+                    help="print the S3 (Espressif USB-Serial-JTAG) port and exit; exit 2 if none. Opens nothing.")
     args = ap.parse_args(argv)
     if args.seconds <= 0:
         ap.error("seconds must be > 0")
 
     def note(msg: str) -> None:
         print(f"[monitor] {msg}", file=sys.stderr, flush=True)
+
+    if args.print_port:
+        p = find_port(want_device=args.port)
+        if p is None or p.vid != ESPRESSIF_VID:
+            note("no ESP32-S3 USB-Serial-JTAG port (303A:1001). Plugged in? If the plug is flipped you get the "
+                 "ESP32's CH340 instead: flip it.")
+            return 2
+        print(p.device)
+        return 0
 
     deadline_find = time.monotonic() + args.wait_port
     info = None
