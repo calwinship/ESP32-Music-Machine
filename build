@@ -1,0 +1,7 @@
+#!/bin/zsh
+# Build the ESP32-S3 app (firmware/s3) with the project's ESP-IDF. Usage: ./build [extra idf.py args]
+set -euo pipefail
+ROOT="${0:A:h}"
+. "$ROOT/tools/idf_env.sh"
+cd "$ROOT/firmware/s3"
+idf.py "$@" build

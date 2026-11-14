@@ -1,0 +1,5 @@
+# Same layout as the vendor demos (verified on this board). 16 MB flash; app slot 8 MB, rest unused for now.
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     ,         0x6000,
+phy_init, data, phy,     ,         0x1000,
+factory,  app,  factory, ,         8M,

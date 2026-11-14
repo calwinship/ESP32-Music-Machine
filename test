@@ -1,0 +1,10 @@
+#!/bin/zsh
+# Host unit tests for the hardware-independent logic (no board, no ESP-IDF needed). Usage: ./test
+set -euo pipefail
+cd "${0:A:h}"
+mkdir -p build-host
+cc -std=c11 -Wall -Wextra -Werror -pedantic -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+   -I firmware/s3/components/logic/include \
+   tests/host/test_logic.c firmware/s3/components/logic/*.c \
+   -o build-host/test_logic
+./build-host/test_logic

@@ -13,3 +13,6 @@ build-host/
 .DS_Store
 __pycache__/
 *.pyc
+
+# Generated from sdkconfig.defaults by the build (defaults are the source of truth)
+firmware/s3/sdkconfig

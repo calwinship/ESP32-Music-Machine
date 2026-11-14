@@ -1,0 +1,45 @@
+# ESP32-S3-Knob-Touch-LCD-1.8 firmware
+
+Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory firmware, hands off).
+**Hardware facts (pins, chip ownership, inter-chip links, verification log): `docs/hardware.md`.** Read it before touching hardware code.
+
+## Commands (repo root)
+- `./build`: build `firmware/s3`
+- `./flash [secs]`: build + flash the **S3 only** + print boot logs (default 8 s)
+- `./logs [secs] [--reset none]`: capture logs without a TTY (resets the board unless `--reset none`)
+- `./test`: host unit tests for `components/logic` (cc + ASan/UBSan, no board needed)
+- `. tools/idf_env.sh`: ESP-IDF shell for manual `idf.py` use
+- `tools/fetch_vendor.sh`: re-create the gitignored `docs/vendor/` (Waveshare demos, schematic, datasheets), checksum-verified
+
+## Toolchain (pinned)
+- **ESP-IDF v5.5.6** at `~/esp/v5.5.6/esp-idf`, CMake 3.30.2 (idf_tools), Homebrew Python 3.12 (3.14 breaks `export.sh`).
+  Chosen 2026-11-14: last 5.x line, supported until ~Jan 2028; the vendor drivers run on it unmodified (verified on hardware).
+  It is past its 12-month "in service" period; v6.x needs driver porting. Revisit before ~mid-2027.
+- Components pinned in `firmware/s3/components/bsp/idf_component.yml`: `esp_lcd_sh8601` 1.0.0, `lvgl` 8.4.0. `dependencies.lock` is committed.
+
+## Layout
+- `firmware/s3/main/`: app wiring and UI (thin)
+- `firmware/s3/components/bsp/`: board drivers; pins only in `include/bsp/board_pins.h`
+- `firmware/s3/components/logic/`: pure C, **no ESP-IDF headers** (knob decoder, value clamp, CST816 parsing)
+- `tests/host/`: tests for `logic`, including an equivalence test against the vendor knob code
+- `tools/monitor.py`: serial capture; survives USB re-enumeration; `--print-port` gives the S3 port only
+- `docs/backups.md`: factory S3 flash backup checksum (file in `~/esp/backups/`, outside git)
+
+## Rules
+- **Never claim something works on hardware without log evidence or the user's confirmation.** You can't see the
+  screen or hear audio: ask specific yes/no questions. Record results in the `docs/hardware.md` verification log.
+- **Flash only the ESP32-S3.** Never flash, erase, or open the port of the ESP32-U4WDH without asking. Its port
+  appears when the USB-C plug is flipped (WCH CH340 `1a86:7523`). Always take the port from `monitor.py --print-port`;
+  never run `idf.py flash` without `-p`.
+- **Keep drivers separate from logic.** Anything decidable without hardware goes in `components/logic` with host tests.
+- **Never guess a pin.** Use only pins in `docs/hardware.md`; mark anything unconfirmed UNVERIFIED.
+- **Commit after each working step** (`./test` passes; hardware steps verified as above).
+- Don't use `idf.py monitor` (needs a TTY); use `./logs`.
+- New user communication: user is new to ESP-IDF; explain choices briefly; stop after each agreed phase.
+
+## Gotchas (details in docs/hardware.md)
+- DAC mute pin XSMT is driven only by the ESP32 (IO32) and floats otherwise. If S3 audio is silent, suspect it first.
+- Vendor audio demo uses left-justified I2S but the DAC is wired for standard I2S (FMT=GND): UNVERIFIED mismatch;
+  use `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG` in our code and compare.
+- Every S3 GPIO is already assigned; there are no spare pins.
+- Opening USB-Serial-JTAG with the wrong DTR/RTS order resets the chip; `monitor.py` handles it.

@@ -206,6 +206,8 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 | 2026-11-14 | **IDF v5.5.6** (CMake 3.30.2 from idf_tools): vendor 08 and 07 rebuilt unmodified (same pin; lock: sh8601 1.0.0, lvgl 8.4.0, cmake_utilities 0.5.3). The only new warnings are 2 Kconfig notices from the 5.3-era sdkconfig. 08 boots with the same log sequence | build logs, `monitor.py` |
 | 2026-11-14 | v5.5.6 08: widgets demo shows correctly; touch switches tabs | user: "yes to both" |
 | 2026-11-14 | v5.5.6 07 loopback: knob clicks audible, louder clockwise; log `vol:` 10→19→12→19→14 | user: "yes to all" + 120 s log |
+| 2026-11-14 | **firmware/s3 (own app, IDF v5.5.6)**: boots; display + touch init OK; knob decoded through `logic/knob` (log `value=51..53 (knob cw)`, `..49 (knob ccw)`) | `./flash` boot log |
+| 2026-11-14 | firmware/s3 UI: arc + number shown; clockwise up / anticlockwise down; tap resets to 50; clean rendering | user: "yes to all" |
 
 ## Known quirks in the vendor demo code (for later)
 

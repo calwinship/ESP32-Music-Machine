@@ -1,0 +1,8 @@
+dependencies:
+  idf: "5.5.6"   # project ESP-IDF version (CLAUDE.md); the only version verified on this board for this code
+  # Pinned to what the vendor demo was built and verified with (docs/hardware.md, "Toolchain versions").
+  espressif/esp_lcd_sh8601:
+    version: "1.0.0"
+  lvgl/lvgl:
+    version: "8.4.0"
+    public: true    # the app's UI code uses LVGL directly

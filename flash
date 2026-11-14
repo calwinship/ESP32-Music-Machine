@@ -1,0 +1,12 @@
+#!/bin/zsh
+# Build and flash firmware/s3 to the ESP32-S3 ONLY, then print the first boot logs. Usage: ./flash [log seconds, default 8]
+# The port is resolved by tools/monitor.py --print-port, which only accepts the S3's USB-Serial-JTAG (303A:1001).
+# If the plug is flipped (ESP32-U4WDH's CH340 shows instead) it refuses, so the ESP32 can never be flashed by accident.
+set -euo pipefail
+ROOT="${0:A:h}"
+. "$ROOT/tools/idf_env.sh"
+PORT=$(python "$ROOT/tools/monitor.py" --print-port)
+echo "flash: ESP32-S3 at $PORT"
+cd "$ROOT/firmware/s3"
+idf.py -p "$PORT" build flash
+python "$ROOT/tools/monitor.py" "${1:-8}"
