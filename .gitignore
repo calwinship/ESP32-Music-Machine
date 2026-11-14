@@ -1,0 +1,15 @@
+# Vendor downloads and extracted demos (re-create with tools/fetch_vendor.sh; committed copies live in docs/ref/)
+docs/vendor/
+# The user's own audio
+recordings/
+
+# ESP-IDF build output
+build/
+managed_components/
+sdkconfig.old
+# Host-test build output
+build-host/
+
+.DS_Store
+__pycache__/
+*.pyc

@@ -1,0 +1,1 @@
+fetched 2026-11-14 from https://www.waveshare.com/wiki/ESP32-S3-Knob-Touch-LCD-1.8
