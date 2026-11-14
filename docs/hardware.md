@@ -185,8 +185,8 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 - Console: primary UART0 at 115200 (`CONFIG_ESP_CONSOLE_UART_DEFAULT`) **plus secondary USB-Serial-JTAG**
   (`CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y`). UART0 has no visible route (see GPIO43/44). **Verified 2026-11-14:** boot and app
   logs arrive on the native-USB port (`/dev/cu.usbmodem101`, 303A:1001). The same console setting appears in all 8 demos.
-- Restore image: flashing the S3 overwrites the factory app. `BIN-S3` (`WX-ESP32S3-KNOB_V1.2.bin`, merged image from 0x0) can restore it
-  (WIKI section "BIN File Flashing").
+- Restore image: flashing the S3 overwrites the factory app. **Restore from our verified backup** (`docs/backups.md`), not `BIN-S3`:
+  `WX-ESP32S3-KNOB_V1.2.bin` differs from this board's shipped firmware in 510 of its 523 4 KB blocks.
 
 ## Hardware verification log
 
@@ -202,7 +202,7 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 | 2026-11-14 | 07 playback variant (`docs/vendor/work/07_Audio_Playback`: `AudioMode=PlaybackMusicmode`, `canon.pcm` replaced by 30 s of the user's "Sporting Paddy", 44.1 kHz s16 stereo) | user: "it sounds perfect" |
 
 | 2026-11-14 | Plug flipped → ESP32 bridge `1a86:7523` at `/dev/cu.usbserial-10`; flipped back → S3 again (port only listed, never opened) | USB watcher log; user did the flips |
-| 2026-11-14 | `tools/monitor.py` survives unplug/replug: 2 port losses, 2 reconnects, and it ignored the CH340 port while flipped. No boot banner after replug, so the S3 kept running while unplugged; **a battery being fitted is the likely reason (UNVERIFIED)** | `monitor.py 150 --reset none` |
+| 2026-11-14 | `tools/monitor.py` survives unplug/replug: 2 port losses, 2 reconnects, and it ignored the CH340 port while flipped. Whether the S3 kept running while unplugged is **unknown**: that build logs nothing after boot, and boot output sent before the port reopens can be lost | `monitor.py 150 --reset none` |
 | 2026-11-14 | **IDF v5.5.6** (CMake 3.30.2 from idf_tools): vendor 08 and 07 rebuilt unmodified (same pin; lock: sh8601 1.0.0, lvgl 8.4.0, cmake_utilities 0.5.3). The only new warnings are 2 Kconfig notices from the 5.3-era sdkconfig. 08 boots with the same log sequence | build logs, `monitor.py` |
 | 2026-11-14 | v5.5.6 08: widgets demo shows correctly; touch switches tabs | user: "yes to both" |
 | 2026-11-14 | v5.5.6 07 loopback: knob clicks audible, louder clockwise; log `vol:` 10→19→12→19→14 | user: "yes to all" + 120 s log |
