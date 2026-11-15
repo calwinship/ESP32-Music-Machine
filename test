@@ -8,7 +8,7 @@ mkdir -p build-host
 for t in tests/host/test_*.c; do
   bin="build-host/${${t:t}%.c}"
   cc -std=c11 -Wall -Wextra -Werror -pedantic -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
-     -I firmware/s3/components/logic/include "$t" firmware/s3/components/logic/*.c -o "$bin"
+     -I firmware/s3/components/logic/include "$t" firmware/s3/components/logic/*.c -lm -o "$bin"
   printf '%s: ' "${t:t}"
   "$bin"
 done

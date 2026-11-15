@@ -33,4 +33,11 @@ void player_task_seek(int32_t clicks);          // +/- SEEK_STEP_MS per click (l
 void player_task_select_tune(uint16_t tune);    // play this tune from its first marker
 void player_status_get(player_status_t *out);   // consistent snapshot
 // Tune list for the UI (valid once tune_count in the status is > 0; the index never changes after that).
-bool player_tune_info(uint16_t tune, char *title, size_t n, uint32_t *colour);   // UTF-8 title, 0xRRGGBB
+typedef struct {
+    char title[TUNE_INDEX_MAX_TITLE + 1];   // UTF-8
+    uint32_t colour;                        // 0xRRGGBB
+    uint16_t icon;                          // FontAwesome code point
+    uint32_t total_ms;
+    uint8_t speed_count;
+} player_tune_brief_t;
+bool player_tune_brief(uint16_t tune, player_tune_brief_t *out);

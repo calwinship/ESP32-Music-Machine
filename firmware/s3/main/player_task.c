@@ -81,14 +81,19 @@ void player_task_select_tune(uint16_t tune) { send(CMD_SELECT, tune); }
 
 static volatile bool s_index_ready;
 
-bool player_tune_info(uint16_t tune, char *title, size_t n, uint32_t *colour)
+bool player_tune_brief(uint16_t tune, player_tune_brief_t *out)
 {
     tune_info_t t;   // tune_index_get only reads the (now constant) index buffer: safe from other tasks
     if (!s_index_ready || !tune_index_get(&s_ix, tune, &t)) {
         return false;
     }
-    strlcpy(title, t.title, n);
-    *colour = t.colour;
+    speed_t sp;
+    speed_at(&t, 0, &sp);
+    strlcpy(out->title, t.title, sizeof(out->title));
+    out->colour = t.colour;
+    out->icon = t.icon;
+    out->total_ms = (uint32_t)((uint64_t)t.total_samples * 1000u / t.sample_rate);
+    out->speed_count = sp.count;
     return true;
 }
 

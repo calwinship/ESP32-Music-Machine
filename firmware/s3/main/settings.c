@@ -11,6 +11,7 @@ static const char *TAG = "settings";
 #define KEY_VOLUME  "volume"
 #define KEY_TUNE    "tune_id"
 #define KEY_POS     "pos_ms"
+#define KEY_GUIDE   "guide_seen"
 
 void settings_init(void)
 {
@@ -86,4 +87,30 @@ void settings_save_resume(uint32_t tune_id, uint32_t position_ms)
 {
     save("resume", write_resume, tune_id, position_ms);
     ESP_LOGI(TAG, "resume point saved: tune %08x at %u ms", (unsigned)tune_id, (unsigned)position_ms);
+}
+
+bool settings_guide_seen(void)
+{
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, KEY_GUIDE, &v) != ESP_OK) {
+            v = 0;
+        }
+        nvs_close(h);
+    }
+    return v != 0;
+}
+
+static esp_err_t write_guide(nvs_handle_t h, uint32_t unused_a, uint32_t unused_b)
+{
+    (void)unused_a;
+    (void)unused_b;
+    return nvs_set_u8(h, KEY_GUIDE, 1);
+}
+
+void settings_save_guide_seen(void)
+{
+    save("guide", write_guide, 0, 0);
+    ESP_LOGI(TAG, "guide marked as seen");
 }

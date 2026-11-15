@@ -1,4 +1,4 @@
-// Settings kept in NVS (namespace "player"): volume and where to resume. NVS is never touched by ./sync-tunes.
+// Settings kept in NVS (namespace "player"): volume, where to resume, whether the guide was seen. NVS is never touched by ./sync-tunes.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -8,3 +8,5 @@ int32_t settings_volume(void);                              // VOLUME_DEFAULT if
 void settings_save_volume(int32_t volume);
 bool settings_resume(uint32_t *tune_id, uint32_t *position_ms);   // false if never saved
 void settings_save_resume(uint32_t tune_id, uint32_t position_ms);
+bool settings_guide_seen(void);                             // false until settings_save_guide_seen()
+void settings_save_guide_seen(void);
