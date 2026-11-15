@@ -7,6 +7,8 @@ recordings/
 build/
 managed_components/
 sdkconfig.old
+# sync-tunes cache, staged files and FAT image
+build-tunes/
 # Host-test build output
 build-host/
 

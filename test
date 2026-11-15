@@ -1,5 +1,6 @@
 #!/bin/zsh
-# Host unit tests for the hardware-independent logic (no board, no ESP-IDF needed). Usage: ./test
+# Host unit tests (no board, no ESP-IDF needed). Usage: ./test
+#   1. components/logic (C, ASan + UBSan)   2. tools/sync_tunes.py (Python stdlib unittest)
 set -euo pipefail
 cd "${0:A:h}"
 mkdir -p build-host
@@ -8,3 +9,4 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic -g -O1 -fsanitize=address,undefined 
    tests/host/test_logic.c firmware/s3/components/logic/*.c \
    -o build-host/test_logic
 ./build-host/test_logic
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/host -p 'test_*.py'

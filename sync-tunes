@@ -1,0 +1,8 @@
+#!/bin/zsh
+# Convert recordings/ to MP3 tunes, write the index + FAT image, and write ONLY the `tunes` partition of the ESP32-S3.
+# Usage: ./sync-tunes [--no-flash] [--accept "<title>"]... [--accept-all]   (details: ./sync-tunes --help)
+# Marker files (start time of each play) live in markers/<title>.txt; sync-tunes never overwrites one.
+set -euo pipefail
+ROOT="${0:A:h}"
+. "$ROOT/tools/idf_env.sh"
+exec python "$ROOT/tools/sync_tunes.py" "$@"

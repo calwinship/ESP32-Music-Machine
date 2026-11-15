@@ -7,7 +7,9 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 - `./build`: build `firmware/s3`
 - `./flash [secs]`: build + flash the **S3 only** + print boot logs (default 8 s)
 - `./logs [secs] [--reset none]`: capture logs without a TTY (resets the board unless `--reset none`)
-- `./test`: host unit tests for `components/logic` (cc + ASan/UBSan, no board needed)
+- `./test`: host unit tests: `components/logic` (cc + ASan/UBSan) and `tools/sync_tunes.py` (Python), no board needed
+- `./sync-tunes [--no-flash] [--accept "<title>"] [--accept-all]`: `recordings/*.m4a` → MP3 + `INDEX.BIN` → FAT image →
+  writes **only** the S3 `tunes` partition (~2–3 min). Refuses if it doesn't fit. Cache/image in gitignored `build-tunes/`
 - `. tools/idf_env.sh`: ESP-IDF shell for manual `idf.py` use
 - `tools/fetch_vendor.sh`: re-create the gitignored `docs/vendor/` (Waveshare demos, schematic, datasheets), checksum-verified
 
@@ -23,6 +25,10 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 - `firmware/s3/components/logic/`: pure C, **no ESP-IDF headers** (knob decoder, value clamp, CST816 parsing)
 - `tests/host/`: tests for `logic`, including an equivalence test against the vendor knob code
 - `tools/monitor.py`: serial capture; survives USB re-enumeration; `--print-port` gives the S3 port only
+- `recordings/`: the user's `.m4a` memos (gitignored; file name = title). `recordings/not-synced/` is ignored by sync
+- `markers/<title>.txt` (git-tracked): start time of each play. sync-tunes only creates missing files, after the user
+  confirms (`--accept`); **never overwrite or edit one without asking.** Format: `markers/README.md`
+- Tunes: MP3 CBR 32 kbps mono 32 kHz (user's listening test, 2026-11-15); tune ID = FNV-1a of the normalised title
 - `docs/backups.md`: factory S3 flash backup checksum (file in `~/esp/backups/`, outside git)
 
 ## Rules
