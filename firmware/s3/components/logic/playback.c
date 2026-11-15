@@ -117,6 +117,19 @@ void player_fail(player_t *p)
     p->state = PLAYER_ERROR;
 }
 
+bool player_seek(player_t *p, uint32_t target)
+{
+    if (p->state == PLAYER_IDLE || p->state == PLAYER_ERROR || p->total_samples == 0) {
+        return false;
+    }
+    p->position = target < p->total_samples ? target : p->total_samples - 1;
+    p->next_log_second = p->position / p->sample_rate;
+    if (p->state == PLAYER_ENDED) {
+        p->state = PLAYER_PAUSED;
+    }
+    return true;
+}
+
 bool player_log_due(player_t *p)
 {
     if (p->state == PLAYER_IDLE) {

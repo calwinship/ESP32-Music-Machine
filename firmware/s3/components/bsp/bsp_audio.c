@@ -2,8 +2,8 @@
 // vendor's verified 07_Audio_Test. Deliberate differences from the vendor (docs/hardware.md, "Known quirks"):
 //  - standard Philips I2S (I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG): the DAC's FMT pin is tied low = I2S. The vendor
 //    uses left-justified (MSB) format.
-//  - fixed gain 0.1 (-20 dB), the same as the vendor demo's volume 10 used in every listening test so far, so the
-//    jack is never louder than what the user has already heard. A volume control comes later.
+//  - gain set by the app (bsp_audio_set_gain_q15, volume steps in logic/controls.h). Until it is set it is 0.1
+//    (-20 dB), the same as the vendor demo's volume 10 used in the first listening tests.
 //  - TX underruns are counted (on_send_q_ovf) and the counter is self-tested at init.
 #include <stdatomic.h>
 #include <string.h>
@@ -25,10 +25,11 @@ static const char *TAG = "bsp_audio";
 #define AUDIO_CHUNK        576         // mono samples converted per i2s_channel_write
 #define AUDIO_WRITE_MS     1000
 #define SELFTEST_MS        300         // > 8 buffers' worth, so the queue fills and underruns must fire
-#define AUDIO_GAIN_Q15     3277        // 0.1 in Q15
+#define AUDIO_GAIN_START   3277        // 0.1 in Q15
 
 static i2s_chan_handle_t s_tx;
 static atomic_uint s_underruns;
+static atomic_uint s_gain = AUDIO_GAIN_START;
 static uint32_t s_selftest;
 static int16_t s_stereo[AUDIO_CHUNK * 2];
 
@@ -111,10 +112,11 @@ esp_err_t bsp_audio_stop(void)
 
 esp_err_t bsp_audio_write_mono(const int16_t *pcm, size_t samples)
 {
+    const int32_t gain = (int32_t)atomic_load_explicit(&s_gain, memory_order_relaxed);
     while (samples) {
         size_t n = samples < AUDIO_CHUNK ? samples : AUDIO_CHUNK;
         for (size_t i = 0; i < n; i++) {
-            int16_t v = pcm ? (int16_t)(((int32_t)pcm[i] * AUDIO_GAIN_Q15) >> 15) : 0;
+            int16_t v = pcm ? (int16_t)(((int32_t)pcm[i] * gain) >> 15) : 0;
             s_stereo[2 * i] = v;
             s_stereo[2 * i + 1] = v;
         }
@@ -131,6 +133,11 @@ esp_err_t bsp_audio_write_mono(const int16_t *pcm, size_t samples)
 esp_err_t bsp_audio_write_silence(size_t samples)
 {
     return bsp_audio_write_mono(NULL, samples);
+}
+
+void bsp_audio_set_gain_q15(uint16_t gain)
+{
+    atomic_store_explicit(&s_gain, gain > 32767 ? 32767u : gain, memory_order_relaxed);
 }
 
 uint32_t bsp_audio_underruns(void)

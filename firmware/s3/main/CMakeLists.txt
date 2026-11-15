@@ -2,4 +2,4 @@
 idf_component_register(
     SRCS "main.c" "player_task.c"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES bsp logic)
+    PRIV_REQUIRES bsp logic nvs_flash)

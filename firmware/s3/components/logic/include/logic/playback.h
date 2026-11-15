@@ -64,6 +64,9 @@ bool player_toggle(player_t *p);
 // and enters PLAYER_ENDED at the last sample. Returns 0 unless PLAYING.
 uint32_t player_accept(player_t *p, uint32_t n);
 void player_fail(player_t *p);
+// Jump to tune sample `target` (clamped to the last sample). PLAYING and PAUSED stay as they are; after the end
+// the player becomes PAUSED at the new position. Returns false (no effect) when idle or failed.
+bool player_seek(player_t *p, uint32_t target);
 // True once for each whole second the position reaches (the first call after start included).
 bool player_log_due(player_t *p);
 uint32_t player_elapsed_ms(const player_t *p);

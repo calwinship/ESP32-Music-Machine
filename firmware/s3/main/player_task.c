@@ -1,6 +1,8 @@
-// Player task: INDEX.BIN -> first tune -> seek to its first marker -> MP3 frames -> esp_audio_codec -> I2S.
-// The decisions (index checks, seek maths, which decoded samples to keep, play/pause/end, when to log) are all in
-// components/logic (host-tested); this file only moves bytes between the file, the decoder and the driver.
+// Player task: INDEX.BIN -> tune -> exact seek -> MP3 frames -> esp_audio_codec -> I2S, driven by a command queue
+// (tap, knob seek, tune change). The decisions (index checks, seek maths, which decoded samples to keep, player
+// state, fades) are in components/logic (host-tested); this file only moves bytes between file, decoder and driver.
+// The loop never stops: while paused or after the end it writes silence, which keeps the DAC clocked and means a
+// stall in this task is always visible as an underrun.
 #include "player_task.h"
 
 #include <stdio.h>
@@ -12,7 +14,9 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
+#include "logic/controls.h"
 
 static const char *TAG = "player";
 
@@ -21,16 +25,15 @@ static const char *TAG = "player";
 #define PLAYER_CORE       1
 #define READ_CHUNK        4096
 #define MAX_FRAME_SAMPLES 1152
-#define PAUSE_SAMPLES     480          // silence written per loop while paused (15 ms at 32 kHz)
-#define DRAIN_MS          200          // silence after the last sample so it plays out before the clocks stop
-#define TAP_BIT           1u
+#define SILENCE_SAMPLES   480          // silence written per loop while paused/ended (15 ms at 32 kHz)
+#define CMD_QUEUE_LEN     16
 #define INDEX_PATH        BSP_TUNES_PATH "/INDEX.BIN"
 
-static TaskHandle_t s_task;
-static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
-static player_status_t s_status = {.title = "loading...", .state = PLAYER_IDLE};
-
-static int16_t s_pcm[MAX_FRAME_SAMPLES * 2];   // decoder output (up to stereo), downmixed in place to mono
+typedef enum { CMD_TAP, CMD_SEEK, CMD_TUNE } cmd_type_t;
+typedef struct {
+    cmd_type_t type;
+    int32_t arg;
+} cmd_t;
 
 typedef struct {
     FILE *f;
@@ -38,9 +41,40 @@ typedef struct {
     size_t len, pos;
     bool eof;
 } reader_t;
-static reader_t s_reader;
 
-// ---- status shared with the UI ------------------------------------------------------------------------------
+static TaskHandle_t s_task;
+static QueueHandle_t s_cmds;
+static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static player_status_t s_status = {.title = "loading...", .state = PLAYER_IDLE};
+
+// Player state: touched only by the player task.
+static int16_t s_pcm[MAX_FRAME_SAMPLES * 2];   // decoder output (up to stereo), downmixed in place to mono
+static int16_t s_ramp[FADE_SAMPLES];
+static reader_t s_reader;
+static tune_index_t s_ix;
+static tune_info_t s_tune;
+static uint16_t s_tune_i;
+static void *s_dec;
+static player_t s_pl;
+static frame_gate_t s_gate;
+static int16_t s_last_out;      // last sample written (before gain); the fade-out ramp starts here
+static uint32_t s_fade_done = FADE_SAMPLES;
+static unsigned s_decode_errors, s_preroll_errors, s_frames;
+static uint32_t s_rate;         // I2S rate (all tunes must share it)
+
+// ---- commands and status ------------------------------------------------------------------------------------
+static void send(cmd_type_t type, int32_t arg)
+{
+    const cmd_t c = {type, arg};
+    if (s_cmds && xQueueSend(s_cmds, &c, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "command queue full: dropped");
+    }
+}
+
+void player_task_tap(void) { send(CMD_TAP, 0); }
+void player_task_seek(int32_t clicks) { send(CMD_SEEK, clicks); }
+void player_task_change_tune(int32_t delta) { send(CMD_TUNE, delta); }
+
 void player_status_get(player_status_t *out)
 {
     taskENTER_CRITICAL(&s_lock);
@@ -48,16 +82,16 @@ void player_status_get(player_status_t *out)
     taskEXIT_CRITICAL(&s_lock);
 }
 
-static void status_set(const player_t *p, const char *title)
+static void status_update(bool title)
 {
     taskENTER_CRITICAL(&s_lock);
     if (title) {
-        text_fold_ascii(s_status.title, sizeof(s_status.title), title);
+        text_fold_ascii(s_status.title, sizeof(s_status.title), s_tune.title);
     }
-    if (p) {
-        s_status.elapsed_ms = player_elapsed_ms(p);
-        s_status.state = p->state;
-    }
+    s_status.elapsed_ms = player_elapsed_ms(&s_pl);
+    s_status.state = s_pl.state;
+    s_status.tune = s_tune_i;
+    s_status.tune_count = s_ix.count;
     taskEXIT_CRITICAL(&s_lock);
 }
 
@@ -69,11 +103,18 @@ static void status_error(const char *msg)
     taskEXIT_CRITICAL(&s_lock);
 }
 
-void player_task_tap(void)
+// "m:ss.cc" for logs
+static const char *log_time(char *buf, size_t n, uint32_t ms)
 {
-    if (s_task) {
-        xTaskNotify(s_task, TAP_BIT, eSetBits);
-    }
+    char mmss[16];
+    text_mmss(mmss, sizeof(mmss), ms);
+    snprintf(buf, n, "%s.%02u", mmss, (unsigned)(ms % 1000u / 10u));
+    return buf;
+}
+
+static uint32_t tune_ms(uint32_t samples)
+{
+    return (uint32_t)((uint64_t)samples * 1000u / s_tune.sample_rate);
 }
 
 // ---- file reading -------------------------------------------------------------------------------------------
@@ -100,7 +141,7 @@ static const uint8_t *reader_next_frame(reader_t *r, uint32_t *flen, bool *bad)
 {
     *bad = false;
     if (!reader_fill(r, 4)) {
-        *bad = r->len != r->pos;   // leftover bytes that are not a frame
+        *bad = r->len != r->pos;
         return NULL;
     }
     uint32_t n = mp3_frame_len(r->buf + r->pos);
@@ -112,6 +153,13 @@ static const uint8_t *reader_next_frame(reader_t *r, uint32_t *flen, bool *bad)
     r->pos += n;
     *flen = n;
     return p;
+}
+
+static bool reader_seek(reader_t *r, uint32_t offset)
+{
+    r->len = r->pos = 0;
+    r->eof = false;
+    return r->f && fseek(r->f, (long)offset, SEEK_SET) == 0;
 }
 
 static uint8_t *load_file(const char *path, size_t *len)
@@ -134,156 +182,193 @@ static uint8_t *load_file(const char *path, size_t *len)
     return buf;
 }
 
-// "m:ss.cc" for logs
-static const char *log_time(char *buf, size_t n, uint32_t ms)
+// ---- output -------------------------------------------------------------------------------------------------
+static void out_write(int16_t *pcm, uint32_t n)
 {
-    char mmss[16];
-    text_mmss(mmss, sizeof(mmss), ms);
-    snprintf(buf, n, "%s.%02u", mmss, (unsigned)(ms % 1000u / 10u));
-    return buf;
+    if (!n) {
+        return;
+    }
+    fade_in(pcm, n, &s_fade_done);
+    if (bsp_audio_write_mono(pcm, n) != ESP_OK) {
+        player_fail(&s_pl);
+    }
+    s_last_out = pcm[n - 1];
 }
 
-// ---- one tune -----------------------------------------------------------------------------------------------
-static void play(const tune_info_t *t)
+// Before audio stops or jumps: ramp from the last sample to silence, and fade in whatever comes next.
+static void out_break(void)
 {
-    char a[24], b[24], path[48];
-    snprintf(path, sizeof(path), "%s/%s", BSP_TUNES_PATH, t->file_name);
-    uint32_t start_ms = t->marker_count ? t->markers_ms[0] : 0;
+    if (s_last_out) {
+        fade_ramp_to_zero(s_last_out, s_ramp, FADE_SAMPLES);
+        bsp_audio_write_mono(s_ramp, FADE_SAMPLES);
+        s_last_out = 0;
+    }
+    s_fade_done = 0;
+}
+
+// ---- seeking and tunes --------------------------------------------------------------------------------------
+// Jump to tune sample `target`: reposition the file, reset the decoder, re-arm the gate. Keeps the play state.
+static bool jump_to(uint32_t target)
+{
     seek_plan_t plan;
-    if (!seek_plan(t, seek_ms_to_sample(start_ms, t->sample_rate), &plan)) {
-        ESP_LOGE(TAG, "first marker %u ms is outside the tune", (unsigned)start_ms);
-        status_error("bad marker");
-        return;
+    if (!seek_plan(&s_tune, target, &plan) || !reader_seek(&s_reader, plan.byte_offset)) {
+        ESP_LOGE(TAG, "seek to sample %u failed", (unsigned)target);
+        player_fail(&s_pl);
+        return false;
     }
-    reader_t *r = &s_reader;
-    memset(r, 0, sizeof(*r));
-    r->f = fopen(path, "rb");
-    if (!r->f || fseek(r->f, (long)plan.byte_offset, SEEK_SET) != 0) {
-        ESP_LOGE(TAG, "cannot open %s at byte %u", path, (unsigned)plan.byte_offset);
-        status_error("cannot open tune");
-        if (r->f) {
-            fclose(r->f);
-        }
-        return;
-    }
-    void *dec = NULL;
-    esp_audio_err_t derr = esp_mp3_dec_open(NULL, 0, &dec);
-    if (derr != ESP_AUDIO_ERR_OK) {
-        ESP_LOGE(TAG, "esp_mp3_dec_open: %d", (int)derr);
-        status_error("decoder failed");
-        fclose(r->f);
-        return;
-    }
-    if (bsp_audio_init(t->sample_rate) != ESP_OK) {
-        status_error("audio init failed");
-        esp_mp3_dec_close(dec);
-        fclose(r->f);
-        return;
-    }
+    esp_mp3_dec_reset(s_dec);
+    frame_gate_init(&s_gate, &plan);
+    player_seek(&s_pl, plan.target_sample);
+    return true;
+}
 
-    player_t pl;
-    player_init(&pl);
-    player_start(&pl, t->sample_rate, t->total_samples, plan.target_sample);
-    frame_gate_t gate;
-    frame_gate_init(&gate, &plan);
-    status_set(&pl, t->title);
-    ESP_LOGI(TAG, "playing %s \"%s\" (id %08x) from %s: read from byte %u (frame %u), target frame %u + %u samples",
-             t->file_name, t->title, (unsigned)t->tune_id, log_time(a, sizeof(a), start_ms),
-             (unsigned)plan.byte_offset, (unsigned)plan.start_frame, (unsigned)plan.target_frame,
-             (unsigned)plan.skip_in_target);
+static uint32_t first_marker_sample(void)
+{
+    return seek_ms_to_sample(s_tune.marker_count ? s_tune.markers_ms[0] : 0, s_tune.sample_rate);
+}
 
-    unsigned preroll_errors = 0, decode_errors = 0, frames = 0;
-    bool reported_first = false;
+// Open tune i and start it playing from its first marker.
+static bool open_tune(uint16_t i)
+{
+    char path[48], a[24];
+    if (s_reader.f) {
+        fclose(s_reader.f);
+        s_reader.f = NULL;
+    }
+    if (!tune_index_get(&s_ix, i, &s_tune)) {
+        return false;
+    }
+    s_tune_i = i;
+    if (s_tune.sample_rate != s_rate) {
+        ESP_LOGE(TAG, "%s is %u Hz but the output runs at %u Hz", s_tune.file_name, (unsigned)s_tune.sample_rate,
+                 (unsigned)s_rate);
+        player_fail(&s_pl);
+        status_update(true);
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/%s", BSP_TUNES_PATH, s_tune.file_name);
+    s_reader.f = fopen(path, "rb");
+    if (!s_reader.f) {
+        ESP_LOGE(TAG, "cannot open %s", path);
+        player_fail(&s_pl);
+        status_update(true);
+        return false;
+    }
+    player_start(&s_pl, s_tune.sample_rate, s_tune.total_samples, 0);
+    s_decode_errors = s_preroll_errors = s_frames = 0;
+    if (!jump_to(first_marker_sample())) {
+        status_update(true);
+        return false;
+    }
     char total[16];
-    text_mmss(total, sizeof(total), (uint32_t)((uint64_t)t->total_samples * 1000u / t->sample_rate));
-    bsp_audio_start();
+    text_mmss(total, sizeof(total), tune_ms(s_tune.total_samples));
+    ESP_LOGI(TAG, "tune %u/%u: %s \"%s\" (id %08x, %s) from %s", (unsigned)i + 1, (unsigned)s_ix.count,
+             s_tune.file_name, s_tune.title, (unsigned)s_tune.tune_id, total,
+             log_time(a, sizeof(a), tune_ms(s_pl.position)));
+    status_update(true);
+    return true;
+}
 
-    while (pl.state == PLAYER_PLAYING || pl.state == PLAYER_PAUSED) {
-        uint32_t bits = 0;
-        if (xTaskNotifyWait(0, UINT32_MAX, &bits, 0) == pdTRUE && (bits & TAP_BIT) && player_toggle(&pl)) {
-            ESP_LOGI(TAG, "%s at %s (tap)", pl.state == PLAYER_PAUSED ? "paused" : "resumed",
-                     log_time(a, sizeof(a), player_elapsed_ms(&pl)));
-        }
-
-        if (pl.state == PLAYER_PAUSED) {
-            bsp_audio_write_silence(PAUSE_SAMPLES);
-        } else {
-            uint32_t flen;
-            bool bad;
-            const uint8_t *frame = reader_next_frame(r, &flen, &bad);
-            if (!frame) {
-                ESP_LOGE(TAG, "%s at %s, %u samples short of the end", bad ? "bad MP3 data" : "file ended",
-                         log_time(a, sizeof(a), player_elapsed_ms(&pl)), (unsigned)(pl.total_samples - pl.position));
-                player_fail(&pl);
-                break;
+static void handle(const cmd_t *c)
+{
+    char a[24], b[24];
+    switch (c->type) {
+    case CMD_TAP:
+        if (s_pl.state == PLAYER_ENDED) {
+            jump_to(first_marker_sample());   // -> paused at the first marker
+            player_toggle(&s_pl);             // -> playing
+            s_fade_done = 0;
+            ESP_LOGI(TAG, "restart from %s (tap)", log_time(a, sizeof(a), tune_ms(s_pl.position)));
+        } else if (s_pl.state == PLAYER_PLAYING || s_pl.state == PLAYER_PAUSED) {
+            if (s_pl.state == PLAYER_PLAYING) {
+                out_break();
+            } else {
+                s_fade_done = 0;
             }
-            bool preroll = frame_gate_in_preroll(&gate);
-            esp_audio_dec_in_raw_t raw = {.buffer = (uint8_t *)frame, .len = flen};
-            esp_audio_dec_out_frame_t out = {.buffer = (uint8_t *)s_pcm, .len = sizeof(s_pcm)};
-            esp_audio_dec_info_t info = {0};
-            derr = esp_mp3_dec_decode(dec, &raw, &out, &info);
-            frames++;
-            uint32_t samples = 0;
-            if (derr == ESP_AUDIO_ERR_OK) {
-                uint32_t ch = info.channel ? info.channel : 1;
-                samples = out.decoded_size / (2u * ch);
-                if (ch == 2) {
-                    for (uint32_t i = 0; i < samples; i++) {
-                        s_pcm[i] = (int16_t)(((int32_t)s_pcm[2 * i] + s_pcm[2 * i + 1]) / 2);
-                    }
-                }
-                if (!reported_first) {
-                    reported_first = true;
-                    ESP_LOGI(TAG, "decoder: first good frame #%u: consumed %u of %u bytes, %u samples, %u Hz, %u ch, "
-                             "%u kbps (%u pre-roll frames failed before it)", frames, (unsigned)raw.consumed,
-                             (unsigned)flen, (unsigned)samples, (unsigned)info.sample_rate, (unsigned)info.channel,
-                             (unsigned)(info.bitrate / 1000u), preroll_errors);
-                    if (info.sample_rate != t->sample_rate) {
-                        ESP_LOGE(TAG, "decoder rate %u Hz != index %u Hz", (unsigned)info.sample_rate,
-                                 (unsigned)t->sample_rate);
-                        player_fail(&pl);
-                        break;
-                    }
-                }
-            } else if (preroll) {
-                preroll_errors++;   // expected: the bit reservoir before the seek point is missing
-            } else if (decode_errors++ < 10) {
-                ESP_LOGE(TAG, "decode error %d at %s (frame %u bytes)", (int)derr,
-                         log_time(a, sizeof(a), player_elapsed_ms(&pl)), (unsigned)flen);
-            }
-            uint32_t first;
-            uint32_t keep = frame_gate_next(&gate, samples, &first);
-            keep = player_accept(&pl, keep);
-            if (keep && bsp_audio_write_mono(s_pcm + first, keep) != ESP_OK) {
-                player_fail(&pl);
-                break;
-            }
+            player_toggle(&s_pl);
+            ESP_LOGI(TAG, "%s at %s (tap)", s_pl.state == PLAYER_PAUSED ? "paused" : "resumed",
+                     log_time(a, sizeof(a), tune_ms(s_pl.position)));
         }
-
-        for (uint32_t n = player_new_underruns(&pl, bsp_audio_underruns()); n; n--) {
-            ESP_LOGW(TAG, "UNDERRUN #%u at %s", (unsigned)(pl.underruns_seen - n + 1),
-                     log_time(a, sizeof(a), player_elapsed_ms(&pl)));
+        break;
+    case CMD_SEEK: {
+        if (s_pl.state != PLAYER_PLAYING && s_pl.state != PLAYER_PAUSED && s_pl.state != PLAYER_ENDED) {
+            break;
         }
-        if (pl.state == PLAYER_PLAYING && player_log_due(&pl)) {
-            char now[16];
-            text_mmss(now, sizeof(now), player_elapsed_ms(&pl));
-            ESP_LOGI(TAG, "pos %s / %s underruns %u", now, total, (unsigned)pl.underruns_seen);
+        uint32_t from = s_pl.position;
+        uint32_t to = seek_target(from, c->arg, s_tune.sample_rate, s_tune.total_samples);
+        if (s_pl.state == PLAYER_PLAYING) {
+            out_break();
         }
-        status_set(&pl, NULL);
+        if (jump_to(to)) {
+            ESP_LOGI(TAG, "seek %+d click(s): %s -> %s (sample %u, %s)", (int)c->arg, log_time(a, sizeof(a), tune_ms(from)),
+                     log_time(b, sizeof(b), tune_ms(s_pl.position)), (unsigned)s_pl.position,
+                     player_state_name(s_pl.state));
+        }
+        break;
     }
-
-    if (pl.state == PLAYER_ENDED) {
-        bsp_audio_write_silence(t->sample_rate * DRAIN_MS / 1000u);
-        player_new_underruns(&pl, bsp_audio_underruns());
+    case CMD_TUNE: {
+        if (!s_ix.count) {
+            break;
+        }
+        if (s_pl.state == PLAYER_PLAYING) {
+            out_break();
+        }
+        int32_t n = s_ix.count;
+        int32_t next = (((int32_t)s_tune_i + c->arg) % n + n) % n;
+        open_tune((uint16_t)next);
+        s_fade_done = 0;
+        break;
     }
-    bsp_audio_stop();
-    status_set(&pl, NULL);
-    ESP_LOGI(TAG, "%s at %s / %s: %u frames, underruns %u, decode errors %u (pre-roll %u), self-test underruns %u",
-             player_state_name(pl.state), log_time(a, sizeof(a), player_elapsed_ms(&pl)),
-             log_time(b, sizeof(b), (uint32_t)((uint64_t)t->total_samples * 1000u / t->sample_rate)), frames,
-             (unsigned)pl.underruns_seen, decode_errors, preroll_errors, (unsigned)bsp_audio_selftest_underruns());
-    esp_mp3_dec_close(dec);
-    fclose(r->f);
+    }
+}
+
+// One decoded frame (or silence when not playing).
+static void step(void)
+{
+    char a[24];
+    if (s_pl.state != PLAYER_PLAYING) {
+        bsp_audio_write_silence(SILENCE_SAMPLES);
+        return;
+    }
+    uint32_t flen;
+    bool bad;
+    const uint8_t *frame = reader_next_frame(&s_reader, &flen, &bad);
+    if (!frame) {
+        ESP_LOGE(TAG, "%s at %s, %u samples short of the end", bad ? "bad MP3 data" : "file ended",
+                 log_time(a, sizeof(a), tune_ms(s_pl.position)), (unsigned)(s_pl.total_samples - s_pl.position));
+        player_fail(&s_pl);
+        return;
+    }
+    bool preroll = frame_gate_in_preroll(&s_gate);
+    esp_audio_dec_in_raw_t raw = {.buffer = (uint8_t *)frame, .len = flen};
+    esp_audio_dec_out_frame_t out = {.buffer = (uint8_t *)s_pcm, .len = sizeof(s_pcm)};
+    esp_audio_dec_info_t info = {0};
+    esp_audio_err_t err = esp_mp3_dec_decode(s_dec, &raw, &out, &info);
+    s_frames++;
+    uint32_t samples = 0;
+    if (err == ESP_AUDIO_ERR_OK) {
+        uint32_t ch = info.channel ? info.channel : 1;
+        samples = out.decoded_size / (2u * ch);
+        if (ch == 2) {
+            for (uint32_t i = 0; i < samples; i++) {
+                s_pcm[i] = (int16_t)(((int32_t)s_pcm[2 * i] + s_pcm[2 * i + 1]) / 2);
+            }
+        }
+    } else if (preroll) {
+        s_preroll_errors++;   // expected: the bit reservoir before the seek point is missing
+    } else if (s_decode_errors++ < 10) {
+        ESP_LOGE(TAG, "decode error %d at %s", (int)err, log_time(a, sizeof(a), tune_ms(s_pl.position)));
+    }
+    uint32_t first;
+    uint32_t keep = player_accept(&s_pl, frame_gate_next(&s_gate, samples, &first));
+    out_write(s_pcm + first, keep);
+    if (s_pl.state == PLAYER_ENDED) {
+        out_break();
+        char b[24];
+        ESP_LOGI(TAG, "ended at %s: %u frames, underruns %u, decode errors %u (pre-roll %u). Tap to play again",
+                 log_time(b, sizeof(b), tune_ms(s_pl.position)), s_frames, (unsigned)s_pl.underruns_seen,
+                 s_decode_errors, s_preroll_errors);
+    }
 }
 
 static void player_task(void *arg)
@@ -291,32 +376,48 @@ static void player_task(void *arg)
     (void)arg;
     size_t len = 0;
     uint8_t *data = load_file(INDEX_PATH, &len);
-    tune_index_t ix;
-    tune_index_err_t err = data ? tune_index_open(&ix, data, len) : TUNE_INDEX_ERR_SIZE;
-    if (!data || err != TUNE_INDEX_OK || ix.count == 0) {
+    tune_index_err_t err = data ? tune_index_open(&s_ix, data, len) : TUNE_INDEX_ERR_SIZE;
+    if (!data || err != TUNE_INDEX_OK || s_ix.count == 0 || !tune_index_get(&s_ix, 0, &s_tune)) {
         ESP_LOGE(TAG, "%s: %s", INDEX_PATH, data ? (err ? tune_index_err_str(err) : "no tunes") : "cannot read");
         status_error("No tunes: run ./sync-tunes");
-    } else {
-        ESP_LOGI(TAG, "%s: %u tunes", INDEX_PATH, ix.count);
-        static tune_info_t t;
-        for (uint16_t i = 0; i < ix.count; i++) {
-            tune_index_get(&ix, i, &t);
-            char d[16], m[16];
-            text_mmss(d, sizeof(d), (uint32_t)((uint64_t)t.total_samples * 1000u / t.sample_rate));
-            snprintf(m, sizeof(m), "%u.%u", (unsigned)(t.marker_count ? t.markers_ms[0] / 1000u : 0),
-                     (unsigned)(t.marker_count ? t.markers_ms[0] % 1000u / 100u : 0));
-            ESP_LOGI(TAG, "  %s %08x %5s starts %u (first %ss) %s", t.file_name, (unsigned)t.tune_id, d,
-                     t.marker_count, m, t.title);
-        }
-        tune_index_get(&ix, 0, &t);
-        play(&t);
+        vTaskSuspend(NULL);
     }
+    ESP_LOGI(TAG, "%s: %u tunes", INDEX_PATH, s_ix.count);
+    if (esp_mp3_dec_open(NULL, 0, &s_dec) != ESP_AUDIO_ERR_OK) {
+        status_error("decoder failed");
+        vTaskSuspend(NULL);
+    }
+    s_rate = s_tune.sample_rate;
+    if (bsp_audio_init(s_rate) != ESP_OK || bsp_audio_start() != ESP_OK) {
+        status_error("audio init failed");
+        vTaskSuspend(NULL);
+    }
+    player_init(&s_pl);
+    open_tune(0);
+
     for (;;) {
-        vTaskDelay(portMAX_DELAY);
+        cmd_t c;
+        while (xQueueReceive(s_cmds, &c, 0) == pdTRUE) {
+            handle(&c);
+        }
+        step();
+        for (uint32_t n = player_new_underruns(&s_pl, bsp_audio_underruns()); n; n--) {
+            char a[24];
+            ESP_LOGW(TAG, "UNDERRUN #%u at %s", (unsigned)(s_pl.underruns_seen - n + 1),
+                     log_time(a, sizeof(a), tune_ms(s_pl.position)));
+        }
+        if (s_pl.state == PLAYER_PLAYING && player_log_due(&s_pl)) {
+            char now[16], total[16];
+            text_mmss(now, sizeof(now), tune_ms(s_pl.position));
+            text_mmss(total, sizeof(total), tune_ms(s_tune.total_samples));
+            ESP_LOGI(TAG, "pos %s / %s underruns %u", now, total, (unsigned)s_pl.underruns_seen);
+        }
+        status_update(false);
     }
 }
 
 void player_task_start(void)
 {
+    s_cmds = xQueueCreate(CMD_QUEUE_LEN, sizeof(cmd_t));
     xTaskCreatePinnedToCore(player_task, "player", PLAYER_STACK, NULL, PLAYER_PRIO, &s_task, PLAYER_CORE);
 }

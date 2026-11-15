@@ -48,7 +48,7 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 ## Gotchas (details in docs/hardware.md)
 - DAC mute pin XSMT is driven only by the ESP32 (IO32) and floats otherwise. If S3 audio is silent, suspect it first.
 - Vendor audio demo uses left-justified I2S but the DAC is wired for standard I2S (FMT=GND). Our code uses Philips (plays
-  correctly); whether the vendor's format was wrong is still UNVERIFIED. Output gain is fixed at 0.1 (vendor volume 10).
+  correctly); whether the vendor's format was wrong is still UNVERIFIED. Volume 0-10 (3 dB steps) in NVS `player/volume`.
 - DAC rates without MCLK: only 16/32/44.1/48 kHz (no 22.05/24 kHz). Verified: 32, 44.1, 48 kHz.
 - Every S3 GPIO is already assigned; there are no spare pins.
 - Opening USB-Serial-JTAG with the wrong DTR/RTS order resets the chip; `monitor.py` handles it.

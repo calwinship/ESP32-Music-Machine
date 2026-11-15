@@ -37,6 +37,8 @@ esp_err_t bsp_audio_stop(void);
 // Blocking write of mono samples, sent identically on left and right.
 esp_err_t bsp_audio_write_mono(const int16_t *pcm, size_t samples);
 esp_err_t bsp_audio_write_silence(size_t samples);
+// Output gain, Q15 (32767 = 1.0), applied to every following write. Safe from any task.
+void bsp_audio_set_gain_q15(uint16_t gain);
 // Times the DMA sent a buffer that had not been refilled (a TX underrun) since bsp_audio_init's self-test.
 uint32_t bsp_audio_underruns(void);
 // Underruns the self-test produced (0 would mean the counter cannot be trusted).
