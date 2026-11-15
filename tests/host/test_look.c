@@ -1,6 +1,9 @@
 // Host tests for logic/look (speed colours, speed scale, tune list curves).
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+#define LLABS(x) llabs((long long)(x))
 
 #include "logic/look.h"
 
@@ -43,37 +46,42 @@ static void test_speed_colours(void)
     CHECK(speed_rgb(7, 8) != 0 && speed_rgb(7, 8) <= 0xFFFFFF);
 }
 
-static void test_scale(void)
+static void test_timeline(void)
 {
-    int32_t x, w;
-    scale_segment(0, 3, 96, 6, &x, &w);
-    CHECK_EQ(x, 0);
-    CHECK_EQ(w, 28);
-    scale_segment(2, 3, 96, 6, &x, &w);
-    CHECK_EQ(x, 68);
-    CHECK(x + w <= 96);
-    scale_segment(1, 2, 96, 6, &x, &w);
-    CHECK_EQ(x, 51);
-    CHECK_EQ(w, 45);
-    scale_segment(0, 0, 96, 6, &x, &w);             // no speeds: whole track, no division by zero
-    CHECK_EQ(w, 96);
+    // Clare Jig-like: 3 speeds, 0..101 s, 101..158 s, 158..203.5 s (ms).
+    const uint32_t b[] = {0, 101000, 157800, 203520};
+    int32_t a0[3], a1[3];
+    timeline_layout(b, 3, 40, a0, a1);
+    CHECK_EQ(a0[0], 20);                            // half a gap after the top
+    CHECK_EQ(a1[2], 3600 - 20);                     // half a gap before the top
+    CHECK_EQ(a0[1] - a1[0], 40);                    // gaps between segments
+    CHECK_EQ(a0[2] - a1[1], 40);
+    int32_t room = 3600 - 3 * 40;                   // lengths in proportion to the durations
+    CHECK(LLABS((a1[0] - a0[0]) - (int64_t)room * 101000 / 203520) <= 1);
+    CHECK(LLABS((a1[2] - a0[2]) - (int64_t)room * 45720 / 203520) <= 1);
 
-    CHECK_EQ(scale_dot_x(0, 0, 3, 96, 6), 0);
-    CHECK_EQ(scale_dot_x(0, 1000, 3, 96, 6), 28);
-    CHECK_EQ(scale_dot_x(1, 500, 3, 96, 6), 34 + 14);
-    CHECK_EQ(scale_dot_x(2, 2000, 3, 96, 6), 96);  // permille clamps
+    CHECK_EQ(timeline_played_d10(b, 0, 0, a0, a1), a0[0]);
+    CHECK_EQ(timeline_played_d10(b, 0, 101000, a0, a1), a1[0]);
+    CHECK_EQ(timeline_played_d10(b, 1, 50000, a0, a1), a0[1]);   // before the segment: nothing played
+    int32_t mid = timeline_played_d10(b, 1, (101000 + 157800) / 2, a0, a1);
+    CHECK(LLABS(mid - (a0[1] + a1[1]) / 2) <= 1);
+    CHECK_EQ(timeline_played_d10(b, 2, 999999, a0, a1), a1[2]);
 
-    CHECK_EQ(scale_speed_at(-20, 3, 96), 0);       // on the "Slow" label
-    CHECK_EQ(scale_speed_at(0, 3, 96), 0);
-    CHECK_EQ(scale_speed_at(31, 3, 96), 0);
-    CHECK_EQ(scale_speed_at(32, 3, 96), 1);
-    CHECK_EQ(scale_speed_at(64, 3, 96), 2);
-    CHECK_EQ(scale_speed_at(95, 3, 96), 2);
-    CHECK_EQ(scale_speed_at(200, 3, 96), 2);       // on the "Fast" label
-    CHECK_EQ(scale_speed_at(47, 2, 96), 0);
-    CHECK_EQ(scale_speed_at(48, 2, 96), 1);
-    CHECK_EQ(scale_speed_at(50, 1, 96), 0);
-    CHECK_EQ(scale_speed_at(50, 0, 96), 0);
+    CHECK_EQ(timeline_segment_at(a0[1] + 5, 3, a0, a1), 1);
+    CHECK_EQ(timeline_segment_at(a1[0] + 10, 3, a0, a1), 0);    // in the gap, nearer segment 0
+    CHECK_EQ(timeline_segment_at(a0[1] - 10, 3, a0, a1), 1);    // in the gap, nearer segment 1
+    CHECK_EQ(timeline_segment_at(5, 3, a0, a1), 0);             // the top gap, just right of the top
+    CHECK_EQ(timeline_segment_at(-5, 3, a0, a1), 2);            // just left of the top (negative angle)
+    CHECK_EQ(timeline_segment_at(3595, 3, a0, a1), 2);
+    CHECK_EQ(timeline_segment_at(1800, 1, a0, a1), 0);
+
+    const uint32_t one[] = {0, 53000};               // single speed: one segment, nearly the whole circle
+    timeline_layout(one, 1, 40, a0, a1);
+    CHECK_EQ(a0[0], 20);
+    CHECK_EQ(a1[0], 3580);
+    const uint32_t flat[] = {5, 5, 5};               // zero-length tune: equal shares, no division by zero
+    timeline_layout(flat, 2, 40, a0, a1);
+    CHECK_EQ(a1[0] - a0[0], a1[1] - a0[1]);
 }
 
 static void test_angles(void)
@@ -86,26 +94,17 @@ static void test_angles(void)
     CHECK_EQ(angle_d10(0, 0), 0);
     CHECK(angle_d10(0, 100) == 1800 || angle_d10(0, 100) == -1800);   // straight down
 
-    const int32_t r = 130, band = 22, half = 620;
-    CHECK(scale_hit(0, -130, r, band, half));      // on the arc at the top
-    CHECK(scale_hit(0, -150, r, band, half));      // just outside it
-    CHECK(scale_hit(0, -110, r, band, half));      // just inside it
-    CHECK(!scale_hit(0, -100, r, band, half));     // the tune icon below: not the scale
-    CHECK(!scale_hit(0, -160, r, band, half));     // the battery above
-    CHECK(scale_hit(100, -83, r, band, half));     // the "Fast" label (50 degrees right)
-    CHECK(!scale_hit(130, 0, r, band, half));      // 90 degrees round: not the scale
-    CHECK(!scale_hit(0, 130, r, band, half));      // bottom
-
-    // A tap's angle -> speed, with the track from -38 to +38 degrees.
-    CHECK_EQ(scale_speed_at(angle_d10(-100, -83) + 380, 3, 760), 0);   // on "Slow"
-    CHECK_EQ(scale_speed_at(angle_d10(0, -130) + 380, 3, 760), 1);     // top = the middle speed
-    CHECK_EQ(scale_speed_at(angle_d10(100, -83) + 380, 3, 760), 2);    // on "Fast"
+    CHECK(ring_hit(0, -173, 148, 190));            // on the ring
+    CHECK(ring_hit(150, 0, 148, 190));
+    CHECK(!ring_hit(0, -126, 148, 190));           // the tune icon / list button: not the ring
+    CHECK(!ring_hit(0, 0, 148, 190));
+    CHECK(!ring_hit(150, 150, 148, 190));          // off the round screen
 }
 
 int main(void)
 {
     test_speed_colours();
-    test_scale();
+    test_timeline();
     test_angles();
     printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

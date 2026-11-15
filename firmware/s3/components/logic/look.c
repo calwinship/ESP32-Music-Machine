@@ -1,6 +1,7 @@
 #include "logic/look.h"
 
 #include <math.h>
+#include <stdint.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -34,40 +35,64 @@ uint32_t speed_rgb(uint8_t index, uint8_t count)
     return blend(SPEED_RGB_MEDIUM, SPEED_RGB_FAST, t - den / 2, den / 2);
 }
 
-void scale_segment(uint8_t index, uint8_t count, int32_t track_w, int32_t gap, int32_t *x, int32_t *w)
+void timeline_layout(const uint32_t *bounds, uint8_t count, int32_t gap_d10, int32_t *a0, int32_t *a1)
 {
     if (count == 0) {
-        *x = 0;
-        *w = track_w;
         return;
     }
-    int32_t seg = (track_w - gap * (count - 1)) / count;
-    if (index >= count) {
-        index = (uint8_t)(count - 1);
+    uint64_t total = bounds[count] > bounds[0] ? bounds[count] - bounds[0] : 0;
+    int64_t room = 3600 - (int64_t)gap_d10 * count;
+    if (room < 0) {
+        room = 0;
     }
-    *x = index * (seg + gap);
-    *w = seg;
+    for (uint8_t i = 0; i < count; i++) {
+        // Cumulative, so rounding never adds up to a drift at the end.
+        uint64_t from = bounds[i] - bounds[0], to = bounds[i + 1] - bounds[0];
+        int64_t s = total ? (int64_t)(from * (uint64_t)room / total) : room * i / count;
+        int64_t e = total ? (int64_t)(to * (uint64_t)room / total) : room * (i + 1) / count;
+        a0[i] = (int32_t)(gap_d10 / 2 + (int64_t)gap_d10 * i + s);
+        a1[i] = (int32_t)(gap_d10 / 2 + (int64_t)gap_d10 * i + e);
+    }
 }
 
-int32_t scale_dot_x(uint8_t index, uint16_t permille, uint8_t count, int32_t track_w, int32_t gap)
+int32_t timeline_played_d10(const uint32_t *bounds, uint8_t index, uint32_t position, const int32_t *a0,
+                            const int32_t *a1)
 {
-    int32_t x, w;
-    scale_segment(index, count, track_w, gap, &x, &w);
-    if (permille > 1000) {
-        permille = 1000;
+    uint32_t b = bounds[index], e = bounds[index + 1];
+    if (position <= b || e <= b) {
+        return a0[index];
     }
-    return x + (int32_t)((int64_t)w * permille / 1000);
+    if (position >= e) {
+        return a1[index];
+    }
+    return a0[index] + (int32_t)((int64_t)(a1[index] - a0[index]) * (position - b) / (e - b));
 }
 
-uint8_t scale_speed_at(int32_t x, uint8_t count, int32_t track_w)
+uint8_t timeline_segment_at(int32_t angle_d10, uint8_t count, const int32_t *a0, const int32_t *a1)
 {
-    if (count <= 1 || x < 0 || track_w <= 0) {
+    if (count <= 1) {
         return 0;
     }
-    if (x >= track_w) {
-        return (uint8_t)(count - 1);
+    int32_t a = ((angle_d10 % 3600) + 3600) % 3600;
+    uint8_t best = 0;
+    int32_t best_d = INT32_MAX;
+    for (uint8_t i = 0; i < count; i++) {
+        if (a >= a0[i] && a <= a1[i]) {
+            return i;
+        }
+        // Distance round the circle to the nearer end of this segment.
+        int32_t ends[2] = {a0[i], a1[i]};
+        for (int k = 0; k < 2; k++) {
+            int32_t d = a - ends[k];
+            d = d < 0 ? -d : d;
+            d = d > 1800 ? 3600 - d : d;
+            if (d < best_d) {
+                best_d = d;
+                best = i;
+            }
+        }
     }
-    return (uint8_t)((int64_t)x * count / track_w);
+    return best;
 }
 
 int32_t angle_d10(int32_t dx, int32_t dy)
@@ -79,15 +104,8 @@ int32_t angle_d10(int32_t dx, int32_t dy)
     return (int32_t)lround(a);
 }
 
-bool scale_hit(int32_t dx, int32_t dy, int32_t r, int32_t band, int32_t half_d10)
+bool ring_hit(int32_t dx, int32_t dy, int32_t r_in, int32_t r_out)
 {
-    int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy, lo = r - band, hi = (int64_t)r + band;
-    if (lo < 0) {
-        lo = 0;
-    }
-    if (d2 < lo * lo || d2 > hi * hi) {
-        return false;
-    }
-    int32_t a = angle_d10(dx, dy);
-    return a >= -half_d10 && a <= half_d10;
+    int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy;
+    return d2 >= (int64_t)r_in * r_in && d2 <= (int64_t)r_out * r_out;
 }

@@ -9,14 +9,15 @@ with the knob, and loop a section again and again. All tunes live in the board's
 is needed.
 
 ```
-          ▭ battery
-     Slow ╭─●──╮ Fast        speed arc: one section per speed, dot = where you are
-          🍃                  the tune's icon, in its colour, with a soft glow
-       Clare Jig
+          ▭                   battery (only when not on USB)
+          ❚❚                  shown while paused
+          🍃                  the tune's icon, in the tune's colour (the only colour on a black screen)
+       Clare Jig              wraps to at most two lines inside the ring
          1:42                 elapsed time
-        of 3:23
+         Medium               the current speed, in its colour
           ≡                   tune list
-   ring round the edge: progress through the current speed, in the speed's colour
+   ring round the edge: the whole tune, one segment per speed (teal, amber, coral),
+   each as long as that speed lasts; the played part bright, the rest dim
 ```
 
 ---
@@ -27,13 +28,13 @@ is needed.
 |---|---|
 | **Play / pause** | Tap the screen |
 | **Jump back or forward** | Turn the knob: 2 s per click; fast turns add up |
-| **Choose a speed** | Tap a section of the arc at the top (Slow … Fast); that speed plays from its start |
+| **Choose a speed** | Tap that speed's segment of the ring round the edge; it plays from its start |
 | **Start this speed again** | Double-tap |
 | **Volume** | Press and hold, then turn the knob (0–10, saved) |
 | **Pick a tune** | Tap ≡ at the bottom; scroll (one tune per flick) or turn the knob; tap a tune to play it; swipe right to go back |
 | **How to use** | The last page of the tune list; also shown by itself on the very first start |
 | **Picks up where you left off** | After power-off, the same tune at the same place, paused |
-| **Battery** | Small icon at the top: level on battery, a lightning bolt on USB |
+| **Battery** | Small icon at the top while on battery; hidden on USB |
 | **Themes** | Every tune has its own icon and colour (set in its `markers/` file) |
 | **Irish spelling** | Titles keep their fadas: *Nóra Chríonna* |
 
@@ -87,8 +88,8 @@ The board's other chip (an ESP32 running Waveshare's factory firmware) is left a
   on earlier frames (the "bit reservoir"), so that point is a little before the second itself. The player decodes from
   there and throws away the extra, so a jump lands on the exact sample. This was checked against a full decode on the
   Mac: 75 of 75 positions identical.
-- **Speeds** are the stretches between the start times in a markers file. The ring shows progress through the current
-  speed; the arc at the top shows all of them.
+- **Speeds** are the stretches between the start times in a markers file. The ring round the edge is the whole tune,
+  split into one segment per speed in proportion to its length, and fills in as the tune plays.
 - **Audio never waits for the screen.** The player runs as its own task on the second CPU core, with ~120 ms of
   buffered audio. It counts every buffer underrun and logs it; a full tune plays with `underruns 0`.
 - **Jumps don't click:** the sound fades out and back in over 5 ms around every seek or speed change.
@@ -97,7 +98,9 @@ The board's other chip (an ESP32 running Waveshare's factory firmware) is left a
 - **Boot:** the backlight stays off until the first screen is drawn, then fades in, so there's no white flash. It's
   ready in about 1.5 s.
 - **Battery:** the sense pin reads the battery itself when unplugged, but the USB supply when plugged in. So the
-  level is shown only on battery, smoothed over ~30 s.
+  icon is shown only on battery (smoothed over ~30 s) and hidden on USB.
+- **Titles** are measured in the real font at boot: every one must fit in two lines well inside the ring. The log
+  shows the result (`titles: 16 checked, 0 over 2 lines; farthest corner 134 px`).
 
 ---
 
@@ -157,7 +160,7 @@ Drivers stay thin, and `main/` wires the two together.
 | `player_task_tap / _seek / _play_speed / _restart_speed / _select_tune` | Commands to the player; safe from any task |
 | `player_status_get` | A consistent snapshot for the screen: tune, time, speed, progress, state |
 | `player_tune_brief` | Title, colour, icon, length and number of speeds of any tune (for the list) |
-| `ui_start` | Builds the tune screen, speed arc, tune list and guide, and routes touch and knob |
+| `ui_start` | Builds the tune screen, timeline ring, tune list and guide, and routes touch and knob |
 | `settings_*` | Volume, resume point and "guide seen", kept in NVS (flash that survives power-off and re-syncs) |
 
 **Board drivers (`components/bsp/`)**
@@ -187,7 +190,7 @@ Drivers stay thin, and `main/` wires the two together.
 | `resume_should_save` | Decides when the resume point is worth a flash write |
 | `fade_ramp_to_zero`, `fade_in` | The click-free fades around jumps |
 | `battery_update` | Voltage → battery level, smoothing and "plugged in" |
-| `speed_rgb`, `scale_*`, `angle_d10` | Speed colours and the geometry of the speed arc and its tap band |
+| `speed_rgb`, `timeline_*`, `angle_d10`, `ring_hit` | Speed colours; the timeline ring's segments, played part and which segment a tap hits |
 | `knob_decoder_*`, `cst816_parse` | Raw knob pins → clicks; touch chip report → x/y |
 | `text_mmss`, `text_utf8`, `text_fold_ascii` | Time and text formatting for the screen |
 

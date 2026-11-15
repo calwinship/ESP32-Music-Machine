@@ -25,10 +25,10 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 
 ## Layout
 - `firmware/s3/main/`: app wiring and UI (thin); `player_task.c` = file -> MP3 decoder -> I2S (decisions live in logic);
-  `ui.c` = tune screen, speed arc, paged tune list, guide (input table in `ui.h`); `settings.c` = NVS
+  `ui.c` = tune screen, timeline ring, paged tune list, guide (input table in `ui.h`); `settings.c` = NVS
 - `firmware/s3/components/bsp/`: board drivers; pins only in `include/bsp/board_pins.h`
 - `firmware/s3/components/logic/`: pure C, **no ESP-IDF headers** (knob, CST816, INDEX.BIN parser, seek maths, player
-  state, controls, battery level, `look.h` speed colours + speed-arc geometry)
+  state, controls, battery level, `look.h` speed colours + timeline-ring geometry)
 - `tests/host/`: tests for `logic` (incl. vendor knob equivalence; INDEX.BIN golden fixture shared with Python) and `sync_tunes.py`
 - `tools/monitor.py`: serial capture; survives USB re-enumeration; `--print-port` gives the S3 port only
 - `recordings/`: the user's `.m4a` memos (gitignored; file name = title). `recordings/not-synced/` is ignored by sync

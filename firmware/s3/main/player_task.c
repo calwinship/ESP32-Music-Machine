@@ -104,6 +104,8 @@ void player_status_get(player_status_t *out)
     taskEXIT_CRITICAL(&s_lock);
 }
 
+static uint32_t tune_ms(uint32_t samples);
+
 static void status_update(bool title)
 {
     speed_t sp;
@@ -111,6 +113,11 @@ static void status_update(bool title)
     uint16_t permille = speed_permille(&sp, s_pl.position);
     uint32_t total_ms = s_tune.sample_rate ? (uint32_t)((uint64_t)s_tune.total_samples * 1000u / s_tune.sample_rate)
                                            : 0;
+    uint32_t bounds[TUNE_INDEX_MAX_MARKERS + 1] = {0};
+    for (uint8_t i = 1; i < sp.count && i < TUNE_INDEX_MAX_MARKERS; i++) {
+        bounds[i] = s_tune.sample_rate ? tune_ms(speed_start(&s_tune, i)) : 0;
+    }
+    bounds[sp.count <= TUNE_INDEX_MAX_MARKERS ? sp.count : TUNE_INDEX_MAX_MARKERS] = total_ms;
     taskENTER_CRITICAL(&s_lock);
     if (title) {
         strlcpy(s_status.title, s_tune.title, sizeof(s_status.title));
@@ -126,6 +133,7 @@ static void status_update(bool title)
     s_status.speed = sp.index;
     s_status.speed_count = sp.count;
     s_status.speed_permille = permille;
+    memcpy(s_status.speed_bounds_ms, bounds, sizeof(bounds));
     taskEXIT_CRITICAL(&s_lock);
 }
 

@@ -34,19 +34,17 @@ static const char *TAG = "ui";
 // Tune screen layout (the list pages use the same positions). y offsets from the centre.
 #define ICON_Y            -76
 #define TITLE_Y           -26
-#define TITLE_W           290
+#define TITLE_W           280    // at most 2 lines; checked against the disc at boot (title_check_fit)
+#define TITLE_SAFE_R      160    // no title corner further than this from the centre
 #define TIME_Y            34
 #define SUB_Y             78
-#define GLOW_Y            -20
+#define PAUSE_Y           -122
 
-// Speed scale: an arc concentric with the ring, from SCALE_SPAN_D10/2 left of straight up to as far right.
-#define SCALE_R           130    // px from the centre
-#define SCALE_SPAN_D10    760    // 76 degrees
-#define SCALE_GAP_D10     30     // 3 degrees between segments
-#define SCALE_LABEL_D10   500    // "Slow" / "Fast" sit 50 degrees round, so they follow the curve down
-#define SCALE_BAND        22     // touch band either side of the arc
-#define SCALE_TRACK_W     4
-#define SCALE_DOT         12
+// Timeline ring: the whole tune round the edge, one segment per speed.
+#define TL_GAP_D10        40     // 4 degrees between segments
+#define TL_WIDTH          6
+#define TL_TOUCH_IN       146    // touch band (px from the centre); the ring itself is at 170..176
+#define TL_TOUCH_OUT      190
 
 #define PAGE_H            BSP_LCD_V_RES   // tune list: one page per tune
 #define LIST_MOVING_MS    100    // the list moved this recently: a touch stops it rather than choosing a tune
@@ -59,7 +57,6 @@ static const char *TAG = "ui";
 #define COL_ACCENT        lv_color_hex(0xF2A33A)   // warm amber
 #define COL_VOLUME        lv_color_hex(0xB388FF)   // violet: the ring while in volume mode
 #define COL_BATT          lv_color_hex(0x6A6A6A)   // battery outline: subtle
-#define COL_PLUGGED       lv_color_hex(0x2EC4B6)
 #define COL_LOW           lv_color_hex(0xF2A33A)
 #define COL_EMPTY         lv_color_hex(0xFF5A5F)
 
@@ -72,12 +69,15 @@ static const char *TAG = "ui";
 static lv_color_t speed_colour(uint8_t index, uint8_t count) { return lv_color_hex(speed_rgb(index, count)); }
 
 // Touched only from the LVGL task (timers and event callbacks).
-static lv_obj_t *s_scr, *s_ring, *s_title, *s_time, *s_sub, *s_icon, *s_glow[2];
-static lv_obj_t *s_scale, *s_scale_slow, *s_scale_fast, *s_scale_dot, *s_scale_seg[TUNE_INDEX_MAX_MARKERS];
-static uint8_t s_scale_count;
-static bool s_scale_gesture;        // this touch on the scale became a swipe: not a tap
+static lv_obj_t *s_scr, *s_title, *s_time, *s_sub, *s_icon, *s_pause;
+static lv_obj_t *s_tl, *s_tl_seg[TUNE_INDEX_MAX_MARKERS];
+static uint8_t s_tl_count;
+static int32_t s_tl_a0[TUNE_INDEX_MAX_MARKERS], s_tl_a1[TUNE_INDEX_MAX_MARKERS];
+static uint32_t s_tl_bounds[TUNE_INDEX_MAX_MARKERS + 1];
+static int16_t s_tl_shown_end[TUNE_INDEX_MAX_MARKERS];
+static bool s_tl_gesture;           // this touch on the ring became a swipe: not a tap
 static lv_obj_t *s_list_btn;
-static lv_obj_t *s_batt, *s_batt_fill, *s_batt_bolt;
+static lv_obj_t *s_batt, *s_batt_fill;
 static battery_t s_battery;
 
 static lv_obj_t *s_list, *s_col, *s_list_arc;
@@ -85,7 +85,7 @@ static lv_obj_t **s_rows;
 static player_tune_brief_t *s_briefs;
 static uint16_t s_tune_rows;        // rows 0..s_tune_rows-1 are tunes; the last row is the guide
 static uint16_t s_row_count;
-static int32_t s_spot_row = -1;     // page the list ring is coloured for
+static int32_t s_spot_row = -1;     // page the list ring was last drawn for
 static bool s_list_open;
 static uint32_t s_list_input_ms;
 static int32_t s_list_sel;          // row the list is at (or is animating to)
@@ -162,18 +162,6 @@ static lv_obj_t *list_icon(lv_obj_t *parent, lv_color_t c, lv_align_t align, lv_
         line(box, k_bar, 2, 2, c, LV_ALIGN_CENTER, 0, (lv_coord_t)(i * 7));
     }
     return box;
-}
-
-static void glow_discs(lv_obj_t *parent, lv_obj_t *out[2], lv_coord_t y)
-{
-    const lv_coord_t sizes[2] = {280, 190};
-    for (int i = 0; i < 2; i++) {
-        out[i] = plain(parent);
-        lv_obj_set_size(out[i], sizes[i], sizes[i]);
-        lv_obj_align(out[i], LV_ALIGN_CENTER, 0, y);
-        lv_obj_set_style_radius(out[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(out[i], LV_OPA_10, 0);
-    }
 }
 
 static void anim_opa_cb(void *obj, int32_t v) { lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0); }
@@ -285,11 +273,7 @@ static void list_restyle(void)
 {
     int32_t y = lv_obj_get_scroll_y(s_col), page = (y + PAGE_H / 2) / PAGE_H;
     page = page < 0 ? 0 : page >= s_row_count ? s_row_count - 1 : page;
-    if (page != s_spot_row) {
-        s_spot_row = page;
-        lv_color_t c = page < s_tune_rows ? lv_color_hex(s_briefs[page].colour) : COL_ACCENT;
-        lv_obj_set_style_arc_color(s_list_arc, c, LV_PART_INDICATOR);
-    }
+    s_spot_row = page;
     // Position in the list: a short arc on the ring, moving smoothly as the list scrolls.
     int32_t span = 360 / s_row_count, total = PAGE_H * (s_row_count - 1);
     int32_t start = total > 0 ? y * (360 - span) / total : 0;
@@ -329,6 +313,7 @@ static void list_close(const char *why, bool slide_back)
 }
 
 static void row_event(lv_event_t *e);
+static lv_obj_t *title_label(lv_obj_t *parent);
 
 static lv_obj_t *list_page(uint16_t i)
 {
@@ -339,10 +324,6 @@ static lv_obj_t *list_page(uint16_t i)
     lv_obj_set_user_data(page, (void *)(uintptr_t)i);
     lv_obj_add_event_cb(page, row_event, LV_EVENT_ALL, NULL);
     if (i >= s_tune_rows) {   // the guide: a ring with a "?" where a tune's icon goes
-        lv_obj_t *glow[2];
-        glow_discs(page, glow, GLOW_Y);
-        lv_obj_set_style_bg_color(glow[0], COL_ACCENT, 0);
-        lv_obj_set_style_bg_color(glow[1], COL_ACCENT, 0);
         lv_obj_t *help = plain(page);
         lv_obj_set_size(help, 50, 50);
         lv_obj_align(help, LV_ALIGN_CENTER, 0, ICON_Y);
@@ -360,21 +341,15 @@ static lv_obj_t *list_page(uint16_t i)
         return page;
     }
     const player_tune_brief_t *b = &s_briefs[i];
-    lv_color_t c = lv_color_hex(b->colour);
-    lv_obj_t *glow[2];
-    glow_discs(page, glow, GLOW_Y);
-    lv_obj_set_style_bg_color(glow[0], c, 0);
-    lv_obj_set_style_bg_color(glow[1], c, 0);
 #if UI_HAVE_ICONS
+    lv_color_t c = lv_color_hex(b->colour);   // the tune's colour is on its icon only
     char glyph[5];
     text_utf8(b->icon, glyph);
     lv_label_set_text(label(page, UI_FONT_ICON, c, ICON_Y), b->icon ? glyph : "");
 #endif
     char shown[TUNE_INDEX_MAX_TITLE + 1], len[16];
     text_for_font(shown, sizeof(shown), b->title);
-    lv_obj_t *t = label(page, UI_FONT_TEXT, COL_TEXT, TITLE_Y);
-    lv_obj_set_width(t, TITLE_W);
-    lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
+    lv_obj_t *t = title_label(page);
     lv_label_set_text(t, shown);
     text_mmss(len, sizeof(len), b->total_ms);
     lv_label_set_text(label(page, UI_FONT_TIME, COL_DIM, TIME_Y), len);   // length where the time goes
@@ -427,7 +402,7 @@ static void list_mark_playing(uint16_t playing)
         }
         if (i == playing) {
             lv_label_set_text(sub, "Now playing");
-            lv_obj_set_style_text_color(sub, lv_color_hex(s_briefs[i].colour), 0);
+            lv_obj_set_style_text_color(sub, COL_TEXT, 0);
         } else {
             if (s_briefs[i].speed_count > 1) {
                 lv_label_set_text_fmt(sub, "%u speeds", (unsigned)s_briefs[i].speed_count);
@@ -527,42 +502,38 @@ static void list_event(lv_event_t *e)
     }
 }
 
-// ---- speed scale --------------------------------------------------------------------------------------------
-// An arc around the top, concentric with the ring: "Slow" at its left end, "Fast" at its right, one segment per
-// speed, and a dot that travels along it. Angles in tenths of a degree from straight up (logic/look.h).
-static void polar(int32_t d10, int32_t r, lv_coord_t *x, lv_coord_t *y)
-{
-    float a = (float)d10 * (float)M_PI / 1800.0f;
-    *x = (lv_coord_t)lroundf((float)r * sinf(a));
-    *y = (lv_coord_t)lroundf(-(float)r * cosf(a));
-}
+// ---- timeline ring ------------------------------------------------------------------------------------------
+// The whole tune once round the edge, starting at the top: one segment per speed, its length in proportion to the
+// speed's duration, in the speed's colour; the played part bright, the rest dim (logic/look.h timeline_*).
+// Tapping a segment plays that speed from its start.
+static uint16_t deg(int32_t d10) { return (uint16_t)(((d10 + 5) / 10) % 360); }
 
-static void scale_event(lv_event_t *e)
+static void timeline_event(lv_event_t *e)
 {
     switch (lv_event_get_code(e)) {
-    case LV_EVENT_HIT_TEST: {   // only the band around the arc and its labels; elsewhere is the main screen
+    case LV_EVENT_HIT_TEST: {   // only the band round the edge; inside it is the main screen
         lv_hit_test_info_t *info = lv_event_get_param(e);
-        info->res = scale_hit(info->point->x - BSP_LCD_H_RES / 2, info->point->y - BSP_LCD_V_RES / 2, SCALE_R,
-                              SCALE_BAND, SCALE_LABEL_D10 + 120);
+        info->res = ring_hit(info->point->x - BSP_LCD_H_RES / 2, info->point->y - BSP_LCD_V_RES / 2, TL_TOUCH_IN,
+                             TL_TOUCH_OUT);
         break;
     }
     case LV_EVENT_PRESSED:
-        s_scale_gesture = false;
+        s_tl_gesture = false;
         break;
     case LV_EVENT_GESTURE:
-        s_scale_gesture = true;
+        s_tl_gesture = true;
         break;
     case LV_EVENT_CLICKED: {
         lv_indev_t *indev = lv_indev_get_act();
-        if (s_scale_gesture || s_list_open || s_guide_open || !indev || s_scale_count <= 1) {
+        if (s_tl_gesture || s_list_open || s_guide_open || !indev || s_tl_count == 0) {
             break;
         }
         lv_point_t p;
         lv_indev_get_point(indev, &p);
         int32_t a = angle_d10(p.x - BSP_LCD_H_RES / 2, p.y - BSP_LCD_V_RES / 2);
-        uint8_t to = scale_speed_at(a + SCALE_SPAN_D10 / 2, s_scale_count, SCALE_SPAN_D10);
-        ESP_LOGI(TAG, "speed scale tapped at %+d.%u deg: speed %u of %u", (int)(a / 10), (unsigned)(LV_ABS(a) % 10),
-                 (unsigned)to + 1u, (unsigned)s_scale_count);
+        uint8_t to = timeline_segment_at(a, s_tl_count, s_tl_a0, s_tl_a1);
+        ESP_LOGI(TAG, "ring tapped at %d deg: speed %u of %u", (int)(((a % 3600) + 3600) % 3600 / 10),
+                 (unsigned)to + 1u, (unsigned)s_tl_count);
         player_task_play_speed(to);
         break;
     }
@@ -571,71 +542,93 @@ static void scale_event(lv_event_t *e)
     }
 }
 
-static void scale_build(uint8_t count)
+static void timeline_build(const player_status_t *st)
 {
-    s_scale_count = count;
+    uint8_t n = st->speed_count > TUNE_INDEX_MAX_MARKERS ? TUNE_INDEX_MAX_MARKERS : st->speed_count;
+    s_tl_count = st->total_ms ? n : 0;
+    memcpy(s_tl_bounds, st->speed_bounds_ms, sizeof(s_tl_bounds));
+    if (s_tl_count) {
+        timeline_layout(s_tl_bounds, s_tl_count, TL_GAP_D10, s_tl_a0, s_tl_a1);
+    }
     for (uint8_t i = 0; i < TUNE_INDEX_MAX_MARKERS; i++) {
-        if (i >= count || count <= 1) {
-            lv_obj_add_flag(s_scale_seg[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t *a = s_tl_seg[i];
+        s_tl_shown_end[i] = -1;
+        if (i >= s_tl_count) {
+            lv_obj_add_flag(a, LV_OBJ_FLAG_HIDDEN);
             continue;
         }
-        int32_t x, w;
-        scale_segment(i, count, SCALE_SPAN_D10, SCALE_GAP_D10, &x, &w);
-        int32_t a0 = x - SCALE_SPAN_D10 / 2, a1 = a0 + w;   // tenths of a degree from straight up
-        // lv_arc: degrees clockwise from its rotation (270 = straight up), 0..359.
-        lv_arc_set_bg_angles(s_scale_seg[i], (uint16_t)((a0 / 10 + 360) % 360), (uint16_t)((a1 / 10 + 360) % 360));
-        lv_obj_set_style_arc_color(s_scale_seg[i], speed_colour(i, count), LV_PART_MAIN);
-        lv_obj_clear_flag(s_scale_seg[i], LV_OBJ_FLAG_HIDDEN);
-    }
-    if (count <= 1) {
-        lv_obj_add_flag(s_scale, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_clear_flag(s_scale, LV_OBJ_FLAG_HIDDEN);
+        lv_color_t c = speed_colour(i, s_tl_count);
+        lv_arc_set_bg_angles(a, deg(s_tl_a0[i]), deg(s_tl_a1[i]));
+        lv_obj_set_style_arc_color(a, c, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(a, c, LV_PART_INDICATOR);
+        lv_obj_clear_flag(a, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-static void scale_show(uint8_t speed, uint8_t count, uint16_t permille, bool speed_changed)
+static void timeline_show(uint8_t speed, uint32_t position_ms)
 {
-    static int32_t shown_d10 = INT32_MIN;
-    if (count <= 1) {
-        return;
-    }
-    if (speed_changed) {
-        for (uint8_t i = 0; i < count && i < TUNE_INDEX_MAX_MARKERS; i++) {
-            lv_obj_set_style_arc_opa(s_scale_seg[i], i == speed ? LV_OPA_COVER : LV_OPA_30, LV_PART_MAIN);
+    for (uint8_t i = 0; i < s_tl_count; i++) {
+        int32_t end = i < speed ? s_tl_a1[i]
+                    : i > speed ? s_tl_a0[i]
+                                : timeline_played_d10(s_tl_bounds, i, position_ms, s_tl_a0, s_tl_a1);
+        int16_t e = (int16_t)deg(end);
+        if (e == s_tl_shown_end[i]) {
+            continue;
         }
-        lv_obj_set_style_text_color(s_scale_slow, speed == 0 ? speed_colour(0, count) : COL_DIM, 0);
-        lv_obj_set_style_text_color(s_scale_fast, speed == count - 1 ? speed_colour(speed, count) : COL_DIM, 0);
-        lv_obj_set_style_border_color(s_scale_dot, speed_colour(speed, count), 0);
-        shown_d10 = INT32_MIN;
-    }
-    int32_t d10 = scale_dot_x(speed, permille, count, SCALE_SPAN_D10, SCALE_GAP_D10) - SCALE_SPAN_D10 / 2;
-    if (d10 != shown_d10) {
-        lv_coord_t x, y;
-        polar(d10, SCALE_R, &x, &y);
-        lv_obj_align(s_scale_dot, LV_ALIGN_CENTER, x, y);
-        shown_d10 = d10;
+        s_tl_shown_end[i] = e;
+        bool any = e != deg(s_tl_a0[i]);
+        lv_obj_set_style_arc_opa(s_tl_seg[i], any ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_INDICATOR);
+        if (any) {
+            lv_arc_set_angles(s_tl_seg[i], deg(s_tl_a0[i]), (uint16_t)e);
+        }
     }
 }
 
-// Evidence for "nothing touches the ring": the farthest corner of the top row's parts from the screen centre.
-static void scale_check_fit(void)
+// Title box: centred, wraps, at most 2 lines.
+static lv_obj_t *title_label(lv_obj_t *parent)
 {
-    lv_obj_update_layout(s_scr);
-    lv_obj_t *parts[] = {s_scale_slow, s_scale_fast, s_batt};
+    lv_obj_t *t = label(parent, UI_FONT_TEXT, COL_TEXT, TITLE_Y);
+    lv_obj_set_width(t, TITLE_W);
+    lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_max_height(t, 2 * lv_font_get_line_height(UI_FONT_TEXT), 0);
+    return t;
+}
+
+// Evidence that every title fits: wrapped at TITLE_W, how many lines, and how far the box's corners reach from the
+// centre (the disc inside the ring has radius RING_INNER_R).
+static void title_check_fit(uint16_t tunes)
+{
+    const lv_font_t *f = UI_FONT_TEXT;
+    lv_coord_t lh = lv_font_get_line_height(f);
     float worst = 0;
-    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
-        lv_area_t a;
-        lv_obj_get_coords(parts[i], &a);
-        const lv_coord_t xs[2] = {a.x1, a.x2}, ys[2] = {a.y1, a.y2};
-        for (int k = 0; k < 4; k++) {
-            float dx = xs[k & 1] + 0.5f - BSP_LCD_H_RES / 2.0f, dy = ys[k >> 1] + 0.5f - BSP_LCD_V_RES / 2.0f;
-            float r = sqrtf(dx * dx + dy * dy);
-            worst = r > worst ? r : worst;
+    int too_long = 0;
+    char worst_title[TUNE_INDEX_MAX_TITLE + 1] = "";
+    for (uint16_t i = 0; i < tunes; i++) {
+        player_tune_brief_t b;
+        char shown[TUNE_INDEX_MAX_TITLE + 1];
+        if (!player_tune_brief(i, &b)) {
+            continue;
+        }
+        text_for_font(shown, sizeof(shown), b.title);
+        lv_point_t sz;
+        lv_txt_get_size(&sz, shown, f, 0, 0, TITLE_W, LV_TEXT_FLAG_NONE);
+        int lines = (sz.y + lh - 1) / lh;
+        float h = (float)(lines > 2 ? 2 : lines) * lh;
+        float dx = sz.x / 2.0f, dy = -TITLE_Y + h / 2.0f;   // the top corners are the far ones
+        float r = sqrtf(dx * dx + dy * dy);
+        if (lines > 2) {
+            too_long++;
+        }
+        if (r > worst) {
+            worst = r;
+            strlcpy(worst_title, b.title, sizeof(worst_title));
+        }
+        if (lines > 1 || strcmp(b.title, "Over the Water to Charlie") == 0) {
+            ESP_LOGI(TAG, "title \"%s\": %d line(s), %d px wide", b.title, lines, (int)sz.x);
         }
     }
-    ESP_LOGI(TAG, "top row fits: farthest corner %.0f px from centre (ring inner edge %d px); scale arc r=%d",
-             (double)worst, RING_INNER_R, SCALE_R);
+    ESP_LOGI(TAG, "titles: %u checked, %d over 2 lines; farthest corner %.0f px (\"%s\"), limit %d, disc %d",
+             (unsigned)tunes, too_long, (double)worst, worst_title, TITLE_SAFE_R, RING_INNER_R);
 }
 
 // ---- main screen input --------------------------------------------------------------------------------------
@@ -725,7 +718,7 @@ static void controls_poll(lv_timer_t *t)
 }
 
 // ---- drawing ------------------------------------------------------------------------------------------------
-// Battery icon: outline, a fill for the level, a small bolt when on USB (the pin then reads USB, not the cell).
+// Battery icon: outline and a fill for the level, only while on battery.
 static void battery_show(void)
 {
     static battery_state_t shown;
@@ -751,14 +744,11 @@ static void battery_show(void)
     }
     any = true;
     shown = b;
-    lv_obj_clear_flag(s_batt, LV_OBJ_FLAG_HIDDEN);
-    if (b.plugged) {
-        lv_obj_add_flag(s_batt_fill, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_batt_bolt, LV_OBJ_FLAG_HIDDEN);
+    if (b.plugged) {   // on USB the pin reads the USB supply, not the cell: show nothing
+        lv_obj_add_flag(s_batt, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    lv_obj_add_flag(s_batt_bolt, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(s_batt_fill, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_batt, LV_OBJ_FLAG_HIDDEN);
     lv_coord_t w = (lv_coord_t)(b.level * 18u / 100u);
     lv_obj_set_width(s_batt_fill, w < 2 ? 2 : w);
     lv_obj_set_style_bg_color(s_batt_fill, b.level <= 10 ? COL_EMPTY : b.level <= 20 ? COL_LOW : COL_DIM, 0);
@@ -768,7 +758,7 @@ static void ui_refresh(lv_timer_t *t)
 {
     (void)t;
     static bool first = true;
-    static int32_t shown_ring = -1, shown_volume = -2;
+    static int32_t shown_volume = -2;
     uint32_t now = lv_tick_get();
     player_status_t st;
     player_status_get(&st);
@@ -779,28 +769,34 @@ static void ui_refresh(lv_timer_t *t)
         lv_label_set_text(s_title, buf);
     }
     if (first || st.icon != s_shown.icon || st.colour != s_shown.colour) {
-        // Tune theme: its icon in its colour, and a soft glow of the same colour behind the centre.
-        lv_color_t c = lv_color_hex(st.colour);
+        // Tune theme: its icon in its colour (the only place the tune's colour appears).
         if (s_icon) {
             char glyph[5];
             text_utf8(st.icon, glyph);
             lv_label_set_text(s_icon, st.icon ? glyph : "");
-            lv_obj_set_style_text_color(s_icon, c, 0);
+            lv_obj_set_style_text_color(s_icon, lv_color_hex(st.colour), 0);
         }
-        lv_obj_set_style_bg_color(s_glow[0], c, 0);
-        lv_obj_set_style_bg_color(s_glow[1], c, 0);
+    }
+    bool paused = st.state == PLAYER_PAUSED || st.state == PLAYER_ENDED;
+    if (first || paused != (s_shown.state == PLAYER_PAUSED || s_shown.state == PLAYER_ENDED)) {
+        if (paused) {
+            lv_obj_clear_flag(s_pause, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_pause, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     if (first || st.elapsed_ms / 1000u != s_shown.elapsed_ms / 1000u) {
         char buf[16];
         text_mmss(buf, sizeof(buf), st.elapsed_ms);
         lv_label_set_text(s_time, buf);
     }
-    bool tune_changed = first || st.tune_id != s_shown.tune_id || st.speed_count != s_shown.speed_count;
+    bool tune_changed = first || st.tune_id != s_shown.tune_id || st.speed_count != s_shown.speed_count ||
+                        st.total_ms != s_shown.total_ms;
     bool speed_changed = tune_changed || st.speed != s_shown.speed;
     if (tune_changed) {
-        scale_build(st.speed_count);
+        timeline_build(&st);
     }
-    scale_show(st.speed, st.speed_count, st.speed_permille, speed_changed);
+    timeline_show(st.speed, st.elapsed_ms);
     if (first || st.tune_count != s_shown.tune_count) {
         if (st.tune_count > 0) {
             lv_obj_clear_flag(s_list_btn, LV_OBJ_FLAG_HIDDEN);
@@ -809,27 +805,23 @@ static void ui_refresh(lv_timer_t *t)
         }
     }
 
-    // Ring and the line under the time: playback progress through the current speed, or the volume gauge.
+    // The line under the time: the current speed's name in its colour, or the volume while setting it.
     bool vol = volume_mode_active(&s_vol_mode, now);
-    int32_t ring = vol ? s_volume * 100 : st.speed_permille;
     int32_t volume_shown = vol ? s_volume : -1;
     if (volume_shown != shown_volume || speed_changed) {
-        lv_obj_set_style_arc_color(s_ring, vol ? COL_VOLUME : speed_colour(st.speed, st.speed_count),
-                                   LV_PART_INDICATOR);
-        lv_obj_set_style_text_color(s_sub, vol ? COL_VOLUME : COL_DIM, 0);
         shown_volume = volume_shown;
-        s_shown.total_ms = UINT32_MAX;   // force the sub line to redraw
-    }
-    if (ring != shown_ring) {
-        lv_arc_set_value(s_ring, (int16_t)ring);
-        shown_ring = ring;
-    }
-    if (vol) {
-        lv_label_set_text_fmt(s_sub, "Volume %d", (int)s_volume);
-    } else if (first || st.total_ms / 1000u != s_shown.total_ms / 1000u) {
-        char buf[16];
-        text_mmss(buf, sizeof(buf), st.total_ms);
-        lv_label_set_text_fmt(s_sub, "of %s", buf);
+        if (vol) {
+            lv_obj_set_style_text_color(s_sub, COL_VOLUME, 0);
+            lv_label_set_text_fmt(s_sub, "Volume %d", (int)s_volume);
+        } else {
+            const char *name = speed_name(st.speed, st.speed_count);
+            lv_obj_set_style_text_color(s_sub, speed_colour(st.speed, st.speed_count), 0);
+            if (name) {
+                lv_label_set_text(s_sub, name);   // "" for a single-speed tune
+            } else {
+                lv_label_set_text_fmt(s_sub, "Speed %u", (unsigned)st.speed + 1u);
+            }
+        }
     }
     s_shown = st;
     first = false;
@@ -850,9 +842,7 @@ static void ui_refresh(lv_timer_t *t)
         bsp_backlight_fade_in(FADE_IN_MS);
         ESP_LOGI(TAG, "screen on at %u ms after boot (%s)", (unsigned)esp_log_timestamp(),
                  st.state != PLAYER_IDLE ? "tune shown" : "timeout");
-        if (st.speed_count > 1) {
-            scale_check_fit();
-        }
+        title_check_fit(st.tune_count);
     }
 
     // Remember where we are (NVS), sparingly: logic/controls.h resume_should_save.
@@ -881,7 +871,6 @@ static lv_obj_t *ring(lv_obj_t *parent)
 
 static void build_battery(void)
 {
-    static const lv_point_t pts_bolt[] = {{11, 0}, {7, 5}, {12, 5}, {8, 10}};
     s_batt = plain(s_scr);
     lv_obj_set_size(s_batt, 25, 12);
     lv_obj_align(s_batt, LV_ALIGN_CENTER, 0, -157);
@@ -901,51 +890,49 @@ static void build_battery(void)
     lv_obj_set_pos(s_batt_fill, 1, 1);
     lv_obj_set_style_radius(s_batt_fill, 1, 0);
     lv_obj_set_style_bg_opa(s_batt_fill, LV_OPA_COVER, 0);
-    s_batt_bolt = line(body, pts_bolt, 4, 2, COL_PLUGGED, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_add_flag(s_batt, LV_OBJ_FLAG_HIDDEN);   // until the first reading
+    lv_obj_add_flag(s_batt, LV_OBJ_FLAG_HIDDEN);   // until the first reading, and while on USB
 }
 
-static void build_scale(void)
+static void build_timeline(void)
 {
-    // A full-screen layer whose hit test only accepts the band around the arc (scale_event LV_EVENT_HIT_TEST).
-    s_scale = plain(s_scr);
-    lv_obj_set_size(s_scale, BSP_LCD_H_RES, BSP_LCD_V_RES);
-    lv_obj_center(s_scale);
-    lv_obj_add_flag(s_scale, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_ADV_HITTEST);
-    lv_obj_add_event_cb(s_scale, scale_event, LV_EVENT_ALL, NULL);
+    // A full-screen layer whose hit test only accepts the band round the edge (timeline_event LV_EVENT_HIT_TEST).
+    s_tl = plain(s_scr);
+    lv_obj_set_size(s_tl, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_center(s_tl);
+    lv_obj_add_flag(s_tl, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_ADV_HITTEST);
+    lv_obj_add_event_cb(s_tl, timeline_event, LV_EVENT_ALL, NULL);
     for (uint8_t i = 0; i < TUNE_INDEX_MAX_MARKERS; i++) {
-        lv_obj_t *a = lv_arc_create(s_scale);
-        lv_obj_set_size(a, 2 * SCALE_R + SCALE_TRACK_W, 2 * SCALE_R + SCALE_TRACK_W);   // stroke centred on SCALE_R
+        lv_obj_t *a = lv_arc_create(s_tl);
+        lv_obj_set_size(a, BSP_LCD_H_RES - 8, BSP_LCD_V_RES - 8);   // where the old ring was: 170..176 px
         lv_obj_center(a);
-        lv_obj_set_style_pad_all(a, 0, 0);
         lv_arc_set_rotation(a, 270);
         lv_obj_remove_style(a, NULL, LV_PART_KNOB);
         lv_obj_clear_flag(a, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_style_arc_width(a, SCALE_TRACK_W, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(a, TL_WIDTH, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(a, TL_WIDTH, LV_PART_INDICATOR);
         lv_obj_set_style_arc_rounded(a, true, LV_PART_MAIN);
+        lv_obj_set_style_arc_rounded(a, true, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(a, LV_OPA_30, LV_PART_MAIN);   // unplayed: dim
         lv_obj_set_style_arc_opa(a, LV_OPA_TRANSP, LV_PART_INDICATOR);
         lv_obj_add_flag(a, LV_OBJ_FLAG_HIDDEN);
-        s_scale_seg[i] = a;
+        s_tl_seg[i] = a;
     }
-    lv_coord_t x, y;
-    s_scale_slow = lv_label_create(s_scale);
-    lv_obj_set_style_text_font(s_scale_slow, UI_FONT_SMALL, 0);
-    lv_label_set_text(s_scale_slow, "Slow");
-    polar(-SCALE_LABEL_D10, SCALE_R, &x, &y);
-    lv_obj_align(s_scale_slow, LV_ALIGN_CENTER, x, y);
-    s_scale_fast = lv_label_create(s_scale);
-    lv_obj_set_style_text_font(s_scale_fast, UI_FONT_SMALL, 0);
-    lv_label_set_text(s_scale_fast, "Fast");
-    polar(SCALE_LABEL_D10, SCALE_R, &x, &y);
-    lv_obj_align(s_scale_fast, LV_ALIGN_CENTER, x, y);
-    s_scale_dot = plain(s_scale);   // where we are: a white dot ringed in the speed's colour
-    lv_obj_set_size(s_scale_dot, SCALE_DOT, SCALE_DOT);
-    lv_obj_set_style_radius(s_scale_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_scale_dot, COL_TEXT, 0);
-    lv_obj_set_style_bg_opa(s_scale_dot, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_scale_dot, 2, 0);
-    lv_obj_set_style_border_opa(s_scale_dot, LV_OPA_COVER, 0);
-    lv_obj_add_flag(s_scale, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_pause(void)
+{
+    s_pause = plain(s_scr);   // two rounded bars, shown while paused
+    lv_obj_set_size(s_pause, 18, 20);
+    lv_obj_align(s_pause, LV_ALIGN_CENTER, 0, PAUSE_Y);
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *bar = plain(s_pause);
+        lv_obj_set_size(bar, 6, 20);
+        lv_obj_set_pos(bar, (lv_coord_t)(i * 12), 0);
+        lv_obj_set_style_radius(bar, 2, 0);
+        lv_obj_set_style_bg_color(bar, COL_TEXT, 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    }
+    lv_obj_add_flag(s_pause, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void build_list(void)
@@ -993,20 +980,14 @@ void ui_start(int32_t volume)
     lv_obj_clear_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);   // so a swipe is a gesture, not a scroll
     lv_obj_add_event_cb(s_scr, screen_event, LV_EVENT_ALL, NULL);
 
-    // Progress ring around the edge, glow behind the centre (drawn first so everything else sits on top).
-    s_ring = ring(s_scr);
-    lv_arc_set_range(s_ring, 0, 1000);
-    lv_arc_set_value(s_ring, 0);
-    glow_discs(s_scr, s_glow, GLOW_Y);
-
+    // Pure black; the timeline ring round the edge.
+    build_timeline();
     build_battery();
-    build_scale();
+    build_pause();
 #if UI_HAVE_ICONS
     s_icon = label(s_scr, UI_FONT_ICON, COL_ACCENT, ICON_Y);
 #endif
-    s_title = label(s_scr, UI_FONT_TEXT, COL_TEXT, TITLE_Y);
-    lv_obj_set_width(s_title, TITLE_W);
-    lv_label_set_long_mode(s_title, LV_LABEL_LONG_WRAP);
+    s_title = title_label(s_scr);
     s_time = label(s_scr, UI_FONT_TIME, COL_TEXT, TIME_Y);
     s_sub = label(s_scr, UI_FONT_SMALL, COL_DIM, SUB_Y);
 

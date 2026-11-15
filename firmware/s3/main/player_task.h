@@ -20,6 +20,7 @@ typedef struct {
     uint8_t speed;                          // current play (0-based) and how many the tune has
     uint8_t speed_count;
     uint16_t speed_permille;                // progress through the current play
+    uint32_t speed_bounds_ms[TUNE_INDEX_MAX_MARKERS + 1];   // speed i: [i]..[i+1]; [0] = 0, [speed_count] = end
 } player_status_t;
 
 // resume: start paused at this tune/position if the tune still exists; otherwise play the first tune from its
