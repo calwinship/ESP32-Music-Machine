@@ -214,6 +214,8 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 | 2026-11-15 | **DAC at 32 kHz, no MCLK**: same test, `07_Audio_Rate32` (32000, clip resampled to 32 kHz) | user: normal speed and pitch, no crackle/dropouts |
 | 2026-11-15 | **firmware/s3 partition table v2**: nvs 0x9000/24K, phy_init 0xf000/4K, factory 0x10000/3M, `tunes` data/fat 0x310000/0xCF0000 (13248K) readonly. Bootloader prints all 4 rows; app boots (`app: ready`). Format chosen for tunes: MP3 CBR 32 kbps mono, 32 kHz (user listening test; Opus 24 kbps rejected as "squeaky") | `./flash` boot log; user: UI "all as before" |
 | 2026-11-15 | **`./sync-tunes` first write**: 16 tunes (56.0 min, 13.50 of 13.53 MB) as a fatfsgen raw FAT image to `tunes` via `parttool.py write_partition` (reads the table from the board): `Wrote 13565952 bytes at 0x00310000`, `Hash of data verified`. NVS 0x9000–0xEFFF MD5 identical before/after (`04930c8a…`); `esptool verify_flash` of bootloader, partition table and app: digest matched; app boots as before. Host checks: image parses back (IDF `fatfsparse.py`) identical to the staged files; seeking from the per-second index decodes bit-exact vs a full decode at 75/75 random positions (ffmpeg decoder), 0/25 without the bit-reservoir pre-roll | sync-tunes/esptool output, `./logs` |
+| 2026-11-15 | **Tune player (firmware/s3)**: I2S1 **standard Philips** 16-bit stereo at 32 kHz (mono duplicated), fixed gain 0.1, GPIO0 high; read-only FAT mount of `tunes`; esp_audio_codec 2.6.2 MP3 decoder fed one 144-byte frame per call (consumed 144/144). Underrun self-test (300 ms with no data): 13 underruns, so the counter works. Full tune Clare Jig from its marker 0:06.80 to 3:23.52: `ended ... 5492 frames, underruns 0, decode errors 0`, position logged every second, two tap pause/resume cycles logged | `./logs 240`; user: no glitches, starts at the first note, title + time shown, tap pauses/resumes ("accept all") |
+| 2026-11-15 | Loudness vs the vendor demo (left-justified, same 0.1 gain): user "seems quiet" but unsure whether quieter than the earlier clips. So the left-justified/I2S mismatch theory is **still UNVERIFIED**; Philips format itself plays correctly | user report |
 
 ## Known quirks in the vendor demo code (for later)
 
@@ -225,7 +227,8 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
   (`bit_shift = false` in IDF v5.3.2 `i2s_std.h`, ESP32-S3 branch). PCM5100A FMT is tied to GND, which means standard I2S
   (`Pcm5100a.pdf`, pin table and §9.3.x "FMT … Low for I2S"). If so, the DAC reads each sample one BCK late: about +6 dB, and wrap-around
   above half scale. The demo caps volume at 0.5, which would hide the wrap. "Sounds perfect" fits either way, so it neither confirms nor
-  rules this out. Own code should use `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG` and compare.
+  rules this out. Own code uses `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG` (verified playing correctly 2026-11-15); the
+  loudness comparison was inconclusive, so whether the vendor format was wrong is still open.
 
 ## Toolchain actually used (Phase 1)
 

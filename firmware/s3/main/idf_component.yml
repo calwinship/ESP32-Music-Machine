@@ -1,0 +1,6 @@
+dependencies:
+  idf: "5.5.6"   # project ESP-IDF version (CLAUDE.md)
+  # MP3 decoder (prebuilt library, Espressif Modified MIT licence: Espressif chips only). Pinned: build-checked on
+  # IDF 5.5.6 on 2026-11-15; API used: esp_mp3_dec_open/decode/close (decoder/impl/esp_mp3_dec.h).
+  espressif/esp_audio_codec:
+    version: "2.6.2"

@@ -26,6 +26,27 @@ esp_err_t bsp_knob_start(void);
 // Steps since the last call (+ clockwise, - anticlockwise); clears the count. Safe from any task.
 int32_t bsp_knob_take_delta(void);
 
+// ---- audio: I2S -> CH445P -> PCM5100A -> 3.5 mm jack. Standard (Philips) I2S, 16-bit stereo, no MCLK. ----------
+// Selects the S3 on the DAC switch, configures the channel (left disabled) and self-tests the underrun counter:
+// it runs the channel with no data for 300 ms and logs how many underruns that produced (must be > 0).
+esp_err_t bsp_audio_init(uint32_t sample_rate);
+// Fill the DMA buffers with silence and start the clocks. Write audio right after.
+esp_err_t bsp_audio_start(void);
+// Stop the clocks (no underruns are counted while stopped).
+esp_err_t bsp_audio_stop(void);
+// Blocking write of mono samples, sent identically on left and right.
+esp_err_t bsp_audio_write_mono(const int16_t *pcm, size_t samples);
+esp_err_t bsp_audio_write_silence(size_t samples);
+// Times the DMA sent a buffer that had not been refilled (a TX underrun) since bsp_audio_init's self-test.
+uint32_t bsp_audio_underruns(void);
+// Underruns the self-test produced (0 would mean the counter cannot be trusted).
+uint32_t bsp_audio_selftest_underruns(void);
+
+// ---- storage: the `tunes` partition, read-only FAT ----------------------------------------------------------
+// Tunes are opened by path under this mount point only, so an SD card mounted here can replace the partition.
+#define BSP_TUNES_PATH "/tunes"
+esp_err_t bsp_storage_mount(void);
+
 #ifdef __cplusplus
 }
 #endif

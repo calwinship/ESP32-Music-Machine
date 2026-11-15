@@ -30,3 +30,10 @@
 #define BSP_KNOB_PIN_A       GPIO_NUM_8    // EC1_A
 #define BSP_KNOB_PIN_B       GPIO_NUM_7    // EC1_B
 #define BSP_KNOB_SAMPLE_MS   3             // as in the vendor's bidi_switch_knob.c (TICKS_INTERVAL)
+
+// Audio: I2S (no MCLK) to the PCM5100A through the CH445P switch. As in the vendor's verified 07_Audio_Test
+// (user_config.h:15-17, audio_bsp.c:197-204). Playback at 32 and 48 kHz verified 2026-11-15 (docs/hardware.md).
+#define BSP_I2S_PIN_BCK      GPIO_NUM_39   // S3_I2S_DAC_BCK -> CH445P S2A
+#define BSP_I2S_PIN_WS       GPIO_NUM_40   // S3_I2S_DAC_LRCK/WS -> CH445P S2C
+#define BSP_I2S_PIN_DOUT     GPIO_NUM_41   // S3_I2S_DAC_DIN -> CH445P S2B
+#define BSP_DAC_SWITCH_PIN   GPIO_NUM_0    // I2S_SWITCH_IN (CH445P IN): high = DAC driven by the S3. Strapping pin
