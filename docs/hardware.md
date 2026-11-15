@@ -49,7 +49,7 @@ Net names come from the net table on SCH p2. Every S3 GPIO that the schematic ex
 | GPIO | Net | Function / notes | Source |
 |---|---|---|---|
 | 0 | `I2S_SWITCH_IN` | CH445P `IN`: selects which chip drives the DAC. 10 kΩ pull-up R58. Also on CN1 pin 8. The demo drives it **high to give the DAC to the S3**. Strapping pin. | SCH p2, p5, p1; `DEMO/07_Audio_Test/components/audio_bsp/audio_bsp.c:197-204` |
-| 1 | `BATT_ADC` | ADC1 ch0. 10k/10k divider R62/R63 **from net `5V`**, so it reads the 5 V rail ÷2, not the cell directly. Demo multiplies by 2. | SCH p4, p2; `DEMO/01_ADC_Test/components/adc_bsp/adc_bsp.c:32,46` |
+| 1 | `BATT_ADC` | ADC1 ch0. 10k/10k divider R62/R63 **from net `5V`** (÷2; demo and our code multiply by 2). Measured: **on battery the net is the cell** (4.02–4.06 V), on USB it is the USB rail (4.66–4.78 V), so the cell's charge can be read only while unplugged. | SCH p4, p2; `DEMO/01_ADC_Test/components/adc_bsp/adc_bsp.c:32,46` |
 | 2 | `SDMMC_D3` | SD DAT3 (also CD). 10 kΩ pull-up | SCH p2, p4; `sdcard_bsp.c:19` |
 | 3 | `SDMMC_CMD` | SD CMD, 10 kΩ pull-up | SCH p2, p4; `sdcard_bsp.c:15` |
 | 4 | `SDMMC_SCK` | SD CLK | SCH p2, p4; `sdcard_bsp.c:20` |
@@ -218,6 +218,8 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 | 2026-11-15 | Loudness vs the vendor demo (left-justified, same 0.1 gain): user "seems quiet" but unsure whether quieter than the earlier clips. So the left-justified/I2S mismatch theory is **still UNVERIFIED**; Philips format itself plays correctly | user report |
 | 2026-11-15 | **Player controls**: knob = +/-2 s per click (fast spins combined: +13, +16, -9 clicks logged; clamps at 0:00), seek while paused stays paused; long-press = volume mode (0-10, 3 dB steps; 6 -> 10 -> 4 logged) saved to NVS during playback with no underrun; swipe left/right = next/previous tune (starts at its first marker); tap = play/pause, never changed tune. NVS init kept the existing factory data (no erase). 5 min capture: 0 underruns | `./logs 300 --reset none`; user: "tests above passed" (clean jumps, label shown/hidden, swipes, taps) |
 | 2026-11-15 | **Player UI round 2**: Latin-1 fonts (lv_font_conv 1.5.2; boot log `ui: fonts: Latin-1 (fadas)`), "Nóra Chríonna" shown with fadas; INDEX.BIN v2 (icon + colour per tune); per-tune icon + glow; ring colour per speed (teal/amber/coral); list button; list flick only scrolls (12 px tap slop); x/16 and play/pause icon removed; resume across a re-sync (`resuming tune id cb82b439 at 69481 ms (paused)`) | `./flash` boot log; user: "it looks great" |
+| 2026-11-15 | **Boot fade-in**: backlight held off until the first tune screen is drawn, then a 180 ms fade (`screen on at 1561 ms after boot (tune shown)`); **tune list** of 64 px rows with centre snap and edge fade; tap plays the tapped tune | `./logs 300`; user: "the flash is gone", "all good" |
+| 2026-11-15 | **BATT_ADC (GPIO1)** via `bsp_supply_mv` (ADC1 ch0, 12 dB, curve-fitting cal., x2): USB 4658–4784 mV (log, 17 reads); battery only 4.02–4.06 V (user reading the temporary on-screen value). So the `5V` net is the cell on battery | `./logs 300`; user report |
 
 ## Known quirks in the vendor demo code (for later)
 

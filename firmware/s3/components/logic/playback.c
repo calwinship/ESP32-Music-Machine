@@ -91,6 +91,12 @@ uint16_t speed_permille(const speed_t *s, uint32_t position)
     return (uint16_t)((uint64_t)(position - s->start) * 1000u / (s->end - s->start));
 }
 
+void speed_hints(uint8_t index, uint8_t count, bool *prev, bool *next)
+{
+    *prev = count > 1 && index > 0;
+    *next = count > 1 && (uint32_t)index + 1u < count;
+}
+
 const char *speed_name(uint8_t index, uint8_t count)
 {
     static const char *const two[] = {"Slow", "Fast"};

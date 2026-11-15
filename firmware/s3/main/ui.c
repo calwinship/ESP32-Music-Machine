@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "bsp/bsp.h"
@@ -13,19 +14,29 @@
 
 static const char *TAG = "ui";
 
-#define UI_REFRESH_MS   100
-#define CONTROLS_MS     20
-#define VOLUME_SAVE_MS  2000   // save volume this long after the last change (limits flash writes)
-#define LIST_IDLE_MS    6000
-#define TAP_SLOP_PX     12     // a touch that moves further than this is a drag/flick, not a tap
+#define UI_REFRESH_MS     100
+#define CONTROLS_MS       20
+#define VOLUME_SAVE_MS    2000   // save volume this long after the last change (limits flash writes)
+#define LIST_IDLE_MS      6000
+#define REVEAL_TIMEOUT_MS 1500   // light the screen by then even if the player hasn't reported a tune
+#define FADE_IN_MS        180
+#define SUPPLY_SHOW_MS    2000   // TEMPORARY supply readout: screen update period
+#define SUPPLY_LOG_MS     10000  //   and log period
 
-#define COL_BG          lv_color_hex(0x000000)
-#define COL_TEXT        lv_color_hex(0xF2F2F2)
-#define COL_DIM         lv_color_hex(0x8C8C8C)
-#define COL_RING_BG     lv_color_hex(0x262626)
-#define COL_ACCENT      lv_color_hex(0xF2A33A)   // warm amber: list highlight, headings
-#define COL_VOLUME      lv_color_hex(0xB388FF)   // violet: the ring while in volume mode
-#define COL_BUTTON      lv_color_hex(0x1E1E1E)
+// Tune list geometry: big rows (a finger is ~50 px on this screen), the chosen row in the centre.
+#define ROW_H             64
+#define ROW_W             320
+#define TITLE_MAX_W       260
+#define LIST_FADE_PX      160    // rows this far from the centre are at their dimmest
+#define LIST_MOVING_MS    100    // the list moved this recently: a touch stops it rather than choosing a tune
+
+#define COL_BG            lv_color_hex(0x000000)
+#define COL_TEXT          lv_color_hex(0xF2F2F2)
+#define COL_DIM           lv_color_hex(0x8C8C8C)
+#define COL_HINT          lv_color_hex(0x5A5A5A)
+#define COL_RING_BG       lv_color_hex(0x262626)
+#define COL_ACCENT        lv_color_hex(0xF2A33A)   // warm amber
+#define COL_VOLUME        lv_color_hex(0xB388FF)   // violet: the ring while in volume mode
 
 // Ring and speed-name colour for each speed, slowest first: calm teal, amber, coral red. A tune with 2 speeds uses
 // the first and last; a single-speed tune uses amber.
@@ -42,10 +53,18 @@ static lv_color_t speed_colour(uint8_t index, uint8_t count)
 }
 
 // Touched only from the LVGL task (timers and event callbacks).
-static lv_obj_t *s_ring, *s_speed, *s_title, *s_time, *s_sub, *s_list_btn, *s_icon, *s_glow_outer, *s_glow_inner;
-static lv_obj_t *s_list, *s_roller;
+static lv_obj_t *s_scr, *s_ring, *s_speed, *s_title, *s_time, *s_sub, *s_icon, *s_glow_outer, *s_glow_inner;
+static lv_obj_t *s_hint_prev, *s_hint_next, *s_hint_tunes;
+static lv_obj_t *s_supply;          // TEMPORARY: supply voltage readout, to find out what BATT_ADC measures
+static lv_obj_t *s_list, *s_col;
+static lv_obj_t **s_rows;
+static uint16_t s_row_count;
 static bool s_list_open;
 static uint32_t s_list_input_ms;
+static int32_t s_list_sel;          // row the list is at (or is animating to)
+static uint32_t s_list_scroll_ms;   // last time the list moved (flick, snap or knob)
+static bool s_list_knob_target;     // s_list_sel was set by the knob; don't overwrite it from a half-way scroll
+static bool s_press_while_moving;   // this touch landed on a moving list: it stops it, it doesn't choose
 static knob_seek_t s_seek;
 static volume_mode_t s_vol_mode;
 static tap_detector_t s_taps;
@@ -54,9 +73,9 @@ static int32_t s_volume;
 static bool s_volume_dirty;
 static uint32_t s_volume_changed_ms;
 static bool s_gesture_this_press;
-static lv_point_t s_roller_press;
-static bool s_roller_dragged;
 static player_status_t s_shown;
+static bool s_revealed;
+static uint32_t s_start_ms;
 
 static void text_for_font(char *dst, size_t n, const char *utf8)
 {
@@ -68,88 +87,198 @@ static void text_for_font(char *dst, size_t n, const char *utf8)
 }
 
 // ---- tune list ----------------------------------------------------------------------------------------------
+// A vertical column of rows that snaps a row to the centre. Rows fade out towards the top and bottom edges of the
+// round screen, so there are no hard edges or highlight bars: the centre row is simply the brightest.
+static void list_restyle(void)
+{
+    lv_area_t c;
+    lv_obj_get_coords(s_col, &c);
+    lv_coord_t mid = (lv_coord_t)((c.y1 + c.y2) / 2);
+    for (uint16_t i = 0; i < s_row_count; i++) {
+        lv_area_t a;
+        lv_obj_get_coords(s_rows[i], &a);
+        int32_t d = LV_ABS((a.y1 + a.y2) / 2 - mid);
+        lv_opa_t opa = d >= LIST_FADE_PX ? 30 : (lv_opa_t)(255 - d * 225 / LIST_FADE_PX);
+        if (lv_obj_get_style_opa(s_rows[i], 0) != opa) {
+            lv_obj_set_style_opa(s_rows[i], opa, 0);
+        }
+    }
+}
+
+static int32_t list_row_at_scroll(void)
+{
+    int32_t i = (lv_obj_get_scroll_y(s_col) + ROW_H / 2) / ROW_H;
+    return i < 0 ? 0 : i >= s_row_count ? s_row_count - 1 : i;
+}
+
+static void list_hidden_cb(lv_anim_t *a)
+{
+    lv_obj_add_flag((lv_obj_t *)a->var, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void anim_opa_cb(void *obj, int32_t v) { lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0); }
+static void anim_y_cb(void *obj, int32_t v) { lv_obj_set_y((lv_obj_t *)obj, (lv_coord_t)v); }
+
+static void list_animate(bool in)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_list);
+    lv_anim_set_time(&a, in ? 180 : 140);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, anim_opa_cb);
+    lv_anim_set_values(&a, in ? LV_OPA_TRANSP : LV_OPA_COVER, in ? LV_OPA_COVER : LV_OPA_TRANSP);
+    if (!in) {
+        lv_anim_set_ready_cb(&a, list_hidden_cb);
+    }
+    lv_anim_start(&a);
+    if (in) {   // rise slightly into place
+        lv_anim_set_exec_cb(&a, anim_y_cb);
+        lv_anim_set_values(&a, 40, 0);
+        lv_anim_set_ready_cb(&a, NULL);
+        lv_anim_start(&a);
+    }
+}
+
 static void list_close(const char *why)
 {
     ESP_LOGI(TAG, "tune list closed (%s)", why);
     s_list_open = false;
-    lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
+    list_animate(false);
+}
+
+static void row_event(lv_event_t *e);
+
+static bool list_build(uint16_t count)
+{
+    s_rows = calloc(count, sizeof(*s_rows));
+    if (!s_rows) {
+        return false;
+    }
+    for (uint16_t i = 0; i < count; i++) {
+        char title[TUNE_INDEX_MAX_TITLE + 1], shown[TUNE_INDEX_MAX_TITLE + 1];
+        uint32_t colour = 0x8C8C8C;
+        if (!player_tune_info(i, title, sizeof(title), &colour)) {
+            strlcpy(title, "?", sizeof(title));
+        }
+        text_for_font(shown, sizeof(shown), title);
+
+        lv_obj_t *row = lv_obj_create(s_col);
+        lv_obj_remove_style_all(row);   // no theme background, border or padding
+        lv_obj_set_size(row, ROW_W, ROW_H);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 12, 0);
+        lv_obj_set_user_data(row, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row, row_event, LV_EVENT_ALL, NULL);
+
+        lv_obj_t *dot = lv_obj_create(row);   // the tune's theme colour
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 10, 10);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(colour), 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *l = lv_label_create(row);
+        lv_obj_set_style_text_font(l, UI_FONT_TEXT, 0);
+        lv_obj_set_style_text_color(l, COL_TEXT, 0);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_label_set_text(l, shown);
+        lv_point_t sz;
+        lv_txt_get_size(&sz, shown, UI_FONT_TEXT, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        lv_obj_set_width(l, sz.x > TITLE_MAX_W ? TITLE_MAX_W : sz.x);
+        s_rows[i] = row;
+    }
+    s_row_count = count;
+    return true;
 }
 
 static void list_open(void)
 {
     player_status_t st;
     player_status_get(&st);
-    if (st.tune_count == 0) {
+    if (st.tune_count == 0 || (!s_rows && !list_build(st.tune_count))) {
         return;
     }
-    if (!lv_roller_get_option_cnt(s_roller) || lv_roller_get_option_cnt(s_roller) != st.tune_count) {
-        // Build the options once: "Title 1\nTitle 2\n..."
-        size_t cap = (size_t)st.tune_count * (TUNE_INDEX_MAX_TITLE + 2);
-        char *opts = heap_caps_malloc(cap, MALLOC_CAP_8BIT);
-        if (!opts) {
-            return;
-        }
-        size_t len = 0;
-        for (uint16_t i = 0; i < st.tune_count; i++) {
-            char title[TUNE_INDEX_MAX_TITLE + 1], shown[TUNE_INDEX_MAX_TITLE + 1];
-            if (!player_tune_title(i, title, sizeof(title))) {
-                strlcpy(title, "?", sizeof(title));
-            }
-            text_for_font(shown, sizeof(shown), title);
-            len += (size_t)snprintf(opts + len, cap - len, "%s%s", i ? "\n" : "", shown);
-        }
-        lv_roller_set_options(s_roller, opts, LV_ROLLER_MODE_NORMAL);
-        free(opts);
-    }
-    lv_roller_set_selected(s_roller, st.tune, LV_ANIM_OFF);
+    s_list_sel = st.tune < s_row_count ? st.tune : 0;
+    s_list_knob_target = false;
     lv_obj_clear_flag(s_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_update_layout(s_list);
+    lv_obj_scroll_to_y(s_col, s_list_sel * ROW_H, LV_ANIM_OFF);
+    list_restyle();
+    list_animate(true);
     s_list_open = true;
     s_list_input_ms = lv_tick_get();
     ESP_LOGI(TAG, "tune list open (%u tunes)", (unsigned)st.tune_count);
 }
 
-static void roller_event(lv_event_t *e)
+static void list_touched(void)
+{
+    s_list_input_ms = lv_tick_get();
+    s_list_knob_target = false;
+    s_press_while_moving = lv_tick_get() - s_list_scroll_ms < LIST_MOVING_MS;
+}
+
+static void row_event(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING || code == LV_EVENT_VALUE_CHANGED) {
-        s_list_input_ms = lv_tick_get();
-    }
-    // The roller scrolls on drag itself, so LVGL still reports a quick flick as a "short click" on release, which
-    // used to play wherever the finger lifted. Only a touch that stayed put is a tap.
-    lv_indev_t *indev = lv_indev_get_act();
-    if (code == LV_EVENT_PRESSED && indev) {
-        lv_indev_get_point(indev, &s_roller_press);
-        s_roller_dragged = false;
-    } else if (code == LV_EVENT_PRESSING && indev) {
-        lv_point_t p;
-        lv_indev_get_point(indev, &p);
-        if (LV_ABS(p.x - s_roller_press.x) > TAP_SLOP_PX || LV_ABS(p.y - s_roller_press.y) > TAP_SLOP_PX) {
-            s_roller_dragged = true;
+    if (code == LV_EVENT_PRESSED) {
+        list_touched();
+    } else if (code == LV_EVENT_CLICKED && s_list_open) {   // LVGL sends no click after a drag that scrolled
+        if (s_press_while_moving) {
+            ESP_LOGI(TAG, "tap stopped the list");
+            return;
         }
-    }
-    if (code == LV_EVENT_SHORT_CLICKED && !s_roller_dragged) {
-        uint16_t sel = lv_roller_get_selected(s_roller);
+        uint16_t i = (uint16_t)(uintptr_t)lv_obj_get_user_data(lv_event_get_target(e));
         player_status_t st;
         player_status_get(&st);
-        if (sel != st.tune) {
-            player_task_select_tune(sel);
+        if (i != st.tune) {
+            player_task_select_tune(i);
         }
-        list_close(sel != st.tune ? "tune chosen" : "current tune tapped");
+        list_close(i != st.tune ? "tune chosen" : "current tune tapped");
     }
 }
 
-static void list_button_event(lv_event_t *e)
+static void col_event(lv_event_t *e)
 {
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED && !s_list_open) {
-        list_open();
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_PRESSED:   // on the padding above the first / below the last row
+        list_touched();
+        break;
+    case LV_EVENT_SCROLL:
+        list_restyle();
+        s_list_input_ms = s_list_scroll_ms = lv_tick_get();
+        break;
+    case LV_EVENT_SCROLL_END:
+        if (!s_list_knob_target) {
+            s_list_sel = list_row_at_scroll();
+        }
+        list_restyle();
+        break;
+    default:
+        break;
+    }
+}
+
+static void list_event(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_GESTURE && s_list_open) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
+        if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
+            list_close("swipe");
+        }
     }
 }
 
 // ---- main screen input --------------------------------------------------------------------------------------
 static void screen_event(lv_event_t *e)
 {
-    if (s_list_open) {
-        return;   // the list handles its own input
+    // Only touches on the main screen itself. Events bubbling up from the list (e.g. the swipe that closes it) and
+    // anything while the list is open are not for us.
+    if (s_list_open || lv_event_get_target(e) != s_scr) {
+        return;
     }
     switch (lv_event_get_code(e)) {
     case LV_EVENT_PRESSED:
@@ -161,6 +290,9 @@ static void screen_event(lv_event_t *e)
         if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
             ESP_LOGI(TAG, "swipe %s", dir == LV_DIR_LEFT ? "left: next speed" : "right: previous speed");
             player_task_change_speed(dir == LV_DIR_LEFT ? 1 : -1);
+        } else if (dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
+            ESP_LOGI(TAG, "swipe %s: tune list", dir == LV_DIR_TOP ? "up" : "down");
+            list_open();
         }
         break;
     }
@@ -192,9 +324,10 @@ static void controls_poll(lv_timer_t *t)
     }
     if (s_list_open) {
         if (delta) {
-            int32_t sel = (int32_t)lv_roller_get_selected(s_roller) + delta;
-            int32_t last = (int32_t)lv_roller_get_option_cnt(s_roller) - 1;
-            lv_roller_set_selected(s_roller, (uint16_t)(sel < 0 ? 0 : sel > last ? last : sel), LV_ANIM_ON);
+            int32_t sel = s_list_sel + delta, last = (int32_t)s_row_count - 1;
+            s_list_sel = sel < 0 ? 0 : sel > last ? last : sel;
+            s_list_knob_target = true;
+            lv_obj_scroll_to_y(s_col, s_list_sel * ROW_H, LV_ANIM_ON);
             s_list_input_ms = now;
         }
         if (now - s_list_input_ms >= LIST_IDLE_MS) {
@@ -226,6 +359,34 @@ static void controls_poll(lv_timer_t *t)
 }
 
 // ---- drawing ------------------------------------------------------------------------------------------------
+static void hints_update(const player_status_t *st)
+{
+    bool prev, next;
+    speed_hints(st->speed, st->speed_count, &prev, &next);
+    // Each side's chevron is tinted with the colour of the speed it leads to.
+    if (prev) {
+        lv_obj_set_style_line_color(s_hint_prev, speed_colour(st->speed - 1, st->speed_count), 0);
+        lv_obj_clear_flag(s_hint_prev, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_hint_prev, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (next) {
+        lv_obj_set_style_line_color(s_hint_next, speed_colour(st->speed + 1, st->speed_count), 0);
+        lv_obj_clear_flag(s_hint_next, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_hint_next, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static bool first_supply_due(uint32_t now, uint32_t *last, uint32_t period)
+{
+    if (*last && now - *last < period) {
+        return false;
+    }
+    *last = now ? now : 1;
+    return true;
+}
+
 static void ui_refresh(lv_timer_t *t)
 {
     (void)t;
@@ -268,6 +429,14 @@ static void ui_refresh(lv_timer_t *t)
         } else {
             lv_label_set_text_fmt(s_speed, "Speed %u/%u", (unsigned)st.speed + 1u, (unsigned)st.speed_count);
         }
+        hints_update(&st);
+    }
+    if (first || st.tune_count != s_shown.tune_count) {
+        if (st.tune_count > 1) {
+            lv_obj_clear_flag(s_hint_tunes, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_hint_tunes, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     // Ring and the line under the time: playback progress through the current speed, or the volume gauge.
@@ -295,6 +464,26 @@ static void ui_refresh(lv_timer_t *t)
     s_shown = st;
     first = false;
 
+    // TEMPORARY: supply voltage on screen and in the log, until we know whether it tracks the battery.
+    static uint32_t supply_shown_ms, supply_logged_ms;
+    if (first_supply_due(now, &supply_shown_ms, SUPPLY_SHOW_MS)) {
+        uint32_t mv = bsp_supply_mv();
+        lv_label_set_text_fmt(s_supply, "%u.%02u V", (unsigned)(mv / 1000u), (unsigned)(mv % 1000u / 10u));
+        if (first_supply_due(now, &supply_logged_ms, SUPPLY_LOG_MS)) {
+            ESP_LOGI(TAG, "supply %u mV", (unsigned)mv);
+        }
+    }
+
+    // Boot: light the screen only once it shows the tune (or an error), so there's no flash of an empty or white
+    // screen. Draw the frame now, then fade the backlight in.
+    if (!s_revealed && ((st.state != PLAYER_IDLE && st.title[0]) || now - s_start_ms >= REVEAL_TIMEOUT_MS)) {
+        s_revealed = true;
+        lv_refr_now(NULL);
+        bsp_backlight_fade_in(FADE_IN_MS);
+        ESP_LOGI(TAG, "screen on at %u ms after boot (%s)", (unsigned)esp_log_timestamp(),
+                 st.state != PLAYER_IDLE ? "tune shown" : "timeout");
+    }
+
     // Remember where we are (NVS), sparingly: logic/controls.h resume_should_save.
     if (st.tune_count && st.state != PLAYER_ERROR && st.state != PLAYER_IDLE &&
         resume_should_save(&s_saver, now, st.tune_id, st.elapsed_ms, st.state == PLAYER_PLAYING)) {
@@ -313,9 +502,28 @@ static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color
     return l;
 }
 
+// A thin rounded chevron drawn as a line (no font glyph needed). `pts` must stay valid: LVGL keeps the pointer.
+static lv_obj_t *chevron(lv_obj_t *parent, const lv_point_t *pts, lv_color_t color, lv_coord_t x, lv_coord_t y)
+{
+    lv_obj_t *l = lv_line_create(parent);
+    lv_line_set_points(l, pts, 3);
+    lv_obj_set_style_line_width(l, 3, 0);
+    lv_obj_set_style_line_rounded(l, true, 0);
+    lv_obj_set_style_line_color(l, color, 0);
+    lv_obj_set_style_line_opa(l, LV_OPA_60, 0);
+    lv_obj_align(l, LV_ALIGN_CENTER, x, y);
+    lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE);
+    return l;
+}
+
 void ui_start(int32_t volume)
 {
+    static const lv_point_t pts_left[] = {{8, 0}, {1, 8}, {8, 16}};
+    static const lv_point_t pts_right[] = {{1, 0}, {8, 8}, {1, 16}};
+    static const lv_point_t pts_down[] = {{1, 1}, {10, 8}, {19, 1}};
+
     s_volume = volume;
+    s_start_ms = lv_tick_get();
     knob_seek_init(&s_seek);
     uint32_t id, ms;
     if (settings_resume(&id, &ms)) {
@@ -324,13 +532,13 @@ void ui_start(int32_t volume)
     if (!bsp_display_lock(-1)) {
         return;
     }
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, COL_BG, 0);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);   // so a swipe is a gesture, not a scroll
-    lv_obj_add_event_cb(scr, screen_event, LV_EVENT_ALL, NULL);
+    s_scr = lv_scr_act();
+    lv_obj_set_style_bg_color(s_scr, COL_BG, 0);
+    lv_obj_clear_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);   // so a swipe is a gesture, not a scroll
+    lv_obj_add_event_cb(s_scr, screen_event, LV_EVENT_ALL, NULL);
 
     // Progress ring around the edge of the round screen: starts at the top, runs clockwise.
-    s_ring = lv_arc_create(scr);
+    s_ring = lv_arc_create(s_scr);
     lv_obj_set_size(s_ring, BSP_LCD_H_RES - 8, BSP_LCD_V_RES - 8);
     lv_obj_center(s_ring);
     lv_arc_set_rotation(s_ring, 270);
@@ -345,73 +553,67 @@ void ui_start(int32_t volume)
     lv_obj_set_style_arc_color(s_ring, COL_ACCENT, LV_PART_INDICATOR);
 
     // Glow: two faint discs in the tune's colour, drawn first so everything else sits on top.
-    s_glow_outer = lv_obj_create(scr);
-    s_glow_inner = lv_obj_create(scr);
+    s_glow_outer = lv_obj_create(s_scr);
+    s_glow_inner = lv_obj_create(s_scr);
     lv_obj_t *discs[2] = {s_glow_outer, s_glow_inner};
     const lv_coord_t sizes[2] = {280, 190};
-    const lv_opa_t opas[2] = {LV_OPA_10, LV_OPA_10};
     for (int i = 0; i < 2; i++) {
         lv_obj_set_size(discs[i], sizes[i], sizes[i]);
         lv_obj_align(discs[i], LV_ALIGN_CENTER, 0, -30);
         lv_obj_set_style_radius(discs[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(discs[i], opas[i], 0);
+        lv_obj_set_style_bg_opa(discs[i], LV_OPA_10, 0);
         lv_obj_set_style_border_width(discs[i], 0, 0);
         lv_obj_clear_flag(discs[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     }
     lv_obj_move_background(s_glow_inner);
     lv_obj_move_background(s_glow_outer);
 
-    s_speed = label(scr, UI_FONT_SMALL, COL_ACCENT, -130);
+    s_speed = label(s_scr, UI_FONT_SMALL, COL_ACCENT, -130);
 #if UI_HAVE_ICONS
-    s_icon = label(scr, UI_FONT_ICON, COL_ACCENT, -88);
+    s_icon = label(s_scr, UI_FONT_ICON, COL_ACCENT, -88);
 #endif
-    s_title = label(scr, UI_FONT_TEXT, COL_TEXT, -36);
+    s_title = label(s_scr, UI_FONT_TEXT, COL_TEXT, -36);
     lv_obj_set_width(s_title, 290);
     lv_label_set_long_mode(s_title, LV_LABEL_LONG_WRAP);
-    s_time = label(scr, UI_FONT_TIME, COL_TEXT, 24);
-    s_sub = label(scr, UI_FONT_SMALL, COL_DIM, 70);
-    // Tune list button at the bottom.
-    s_list_btn = lv_btn_create(scr);
-    lv_obj_set_size(s_list_btn, 64, 44);
-    lv_obj_align(s_list_btn, LV_ALIGN_CENTER, 0, 122);
-    lv_obj_set_style_bg_color(s_list_btn, COL_BUTTON, 0);
-    lv_obj_set_style_bg_color(s_list_btn, lv_color_hex(0x333333), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(s_list_btn, 22, 0);
-    lv_obj_set_style_shadow_width(s_list_btn, 0, 0);
-    lv_obj_t *icon = lv_label_create(s_list_btn);
-    lv_obj_set_style_text_font(icon, UI_FONT_TEXT, 0);
-    lv_obj_set_style_text_color(icon, COL_TEXT, 0);
-    lv_label_set_text(icon, LV_SYMBOL_LIST);
-    lv_obj_center(icon);
-    lv_obj_add_event_cb(s_list_btn, list_button_event, LV_EVENT_CLICKED, NULL);
+    s_time = label(s_scr, UI_FONT_TIME, COL_TEXT, 24);
+    s_sub = label(s_scr, UI_FONT_SMALL, COL_DIM, 70);
+    s_supply = label(s_scr, UI_FONT_SMALL, COL_HINT, -156);
 
-    // Tune list: a full-screen roller on top, hidden until swipe up.
-    s_list = lv_obj_create(scr);
+    // Swipe hints, dim: left/right of the time when there's a speed that way; "Tunes" + down arrow at the bottom.
+    s_hint_prev = chevron(s_scr, pts_left, COL_HINT, -148, 24);
+    s_hint_next = chevron(s_scr, pts_right, COL_HINT, 148, 24);
+    s_hint_tunes = lv_obj_create(s_scr);
+    lv_obj_remove_style_all(s_hint_tunes);
+    lv_obj_set_size(s_hint_tunes, 80, 44);
+    lv_obj_align(s_hint_tunes, LV_ALIGN_CENTER, 0, 130);
+    lv_obj_clear_flag(s_hint_tunes, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *tunes = label(s_hint_tunes, UI_FONT_SMALL, COL_HINT, -8);
+    lv_label_set_text(tunes, "Tunes");
+    chevron(s_hint_tunes, pts_down, COL_HINT, 0, 13);
+
+    // Tune list: full screen on top, hidden until a swipe up/down. Rows are built on first open.
+    s_list = lv_obj_create(s_scr);
+    lv_obj_remove_style_all(s_list);
     lv_obj_set_size(s_list, BSP_LCD_H_RES, BSP_LCD_V_RES);
-    lv_obj_center(s_list);
     lv_obj_set_style_bg_color(s_list, COL_BG, 0);
-    lv_obj_set_style_border_width(s_list, 0, 0);
-    lv_obj_set_style_radius(s_list, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_list, LV_OPA_COVER, 0);
     lv_obj_clear_flag(s_list, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *heading = label(s_list, UI_FONT_SMALL, COL_ACCENT, -128);
-    lv_label_set_text(heading, "Tunes");
-    s_roller = lv_roller_create(s_list);
-    lv_obj_set_width(s_roller, 290);
-    lv_roller_set_visible_row_count(s_roller, 5);
-    lv_obj_center(s_roller);
-    lv_obj_set_style_text_font(s_roller, UI_FONT_TEXT, 0);
-    lv_obj_set_style_text_line_space(s_roller, 14, 0);
-    lv_obj_set_style_bg_opa(s_roller, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_roller, 0, 0);
-    lv_obj_set_style_text_color(s_roller, COL_DIM, 0);
-    lv_obj_set_style_bg_color(s_roller, COL_ACCENT, LV_PART_SELECTED);
-    lv_obj_set_style_bg_opa(s_roller, LV_OPA_COVER, LV_PART_SELECTED);
-    lv_obj_set_style_text_color(s_roller, COL_BG, LV_PART_SELECTED);
-    lv_obj_set_style_radius(s_roller, 10, LV_PART_SELECTED);
-    lv_obj_add_event_cb(s_roller, roller_event, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(s_list, list_event, LV_EVENT_GESTURE, NULL);
+    s_col = lv_obj_create(s_list);
+    lv_obj_remove_style_all(s_col);
+    lv_obj_set_size(s_col, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_center(s_col);
+    lv_obj_set_flex_flow(s_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_ver(s_col, (BSP_LCD_V_RES - ROW_H) / 2, 0);   // so the first and last rows can centre
+    lv_obj_set_scroll_dir(s_col, LV_DIR_VER);
+    lv_obj_set_scroll_snap_y(s_col, LV_SCROLL_SNAP_CENTER);
+    lv_obj_set_scrollbar_mode(s_col, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(s_col, col_event, LV_EVENT_ALL, NULL);
     lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
 
-    lv_timer_create(ui_refresh, UI_REFRESH_MS, NULL);
+    lv_timer_t *refresh = lv_timer_create(ui_refresh, UI_REFRESH_MS, NULL);
+    lv_timer_ready(refresh);   // first run right away
     lv_timer_create(controls_poll, CONTROLS_MS, NULL);
     bsp_display_unlock();
     ESP_LOGI(TAG, "fonts: %s", UI_FOLD_ACCENTS ? "built-in ASCII (accents folded; run tools/gen_fonts.sh)"

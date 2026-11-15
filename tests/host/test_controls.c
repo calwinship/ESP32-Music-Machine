@@ -217,6 +217,27 @@ static void test_speeds(void)
     CHECK(speed_name(3, 5) == NULL);
 }
 
+static void test_speed_hints(void)
+{
+    bool prev, next;
+    speed_hints(0, 3, &prev, &next);
+    CHECK(!prev && next);
+    speed_hints(1, 3, &prev, &next);
+    CHECK(prev && next);
+    speed_hints(2, 3, &prev, &next);
+    CHECK(prev && !next);
+    speed_hints(0, 2, &prev, &next);
+    CHECK(!prev && next);
+    speed_hints(1, 2, &prev, &next);
+    CHECK(prev && !next);
+    speed_hints(0, 1, &prev, &next);
+    CHECK(!prev && !next);
+    speed_hints(0, 0, &prev, &next);
+    CHECK(!prev && !next);
+    speed_hints(255, 255, &prev, &next);   // last of the maximum: no overflow into "next"
+    CHECK(prev && !next);
+}
+
 static void test_resume_find(void)
 {
     FILE *f = fopen("tests/host/fixtures/index_v2.bin", "rb");
@@ -285,6 +306,7 @@ static void test_resume_saving(void)
 int main(void)
 {
     test_speeds();
+    test_speed_hints();
     test_resume_find();
     test_taps();
     test_resume_saving();

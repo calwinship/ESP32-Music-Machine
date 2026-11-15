@@ -33,4 +33,4 @@ void player_task_seek(int32_t clicks);          // +/- SEEK_STEP_MS per click (l
 void player_task_select_tune(uint16_t tune);    // play this tune from its first marker
 void player_status_get(player_status_t *out);   // consistent snapshot
 // Tune list for the UI (valid once tune_count in the status is > 0; the index never changes after that).
-bool player_tune_title(uint16_t tune, char *buf, size_t n);
+bool player_tune_info(uint16_t tune, char *title, size_t n, uint32_t *colour);   // UTF-8 title, 0xRRGGBB

@@ -18,8 +18,14 @@ esp_err_t bsp_display_start(void);
 bool bsp_display_lock(int timeout_ms);
 void bsp_display_unlock(void);
 
-// Backlight PWM duty 0 (off) .. 255 (full).
+// Backlight PWM duty 0 (off) .. 255 (full). bsp_display_start leaves it off.
 void bsp_backlight_set(uint8_t duty);
+// Ramp the backlight from off to full over about `ms` (non-blocking).
+void bsp_backlight_fade_in(uint32_t ms);
+
+// Supply voltage on BATT_ADC (the "5V" net), in mV, averaged over a few reads; 0 if the ADC failed.
+// bsp_battery_init is called by the first read.
+uint32_t bsp_supply_mv(void);
 
 // Start sampling knob #1 every BSP_KNOB_SAMPLE_MS ms.
 esp_err_t bsp_knob_start(void);

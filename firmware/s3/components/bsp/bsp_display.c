@@ -62,6 +62,40 @@ void bsp_backlight_set(uint8_t duty)
     ESP_ERROR_CHECK_WITHOUT_ABORT(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1));
 }
 
+// Fade-in: FADE_STEPS duty steps on an esp_timer (runs in the esp_timer task, not an ISR). Duty follows a square
+// curve so the brightness looks even to the eye rather than jumping up at the start.
+#define FADE_STEPS 12
+static esp_timer_handle_t s_fade_timer;
+static int s_fade_step;
+
+static void fade_cb(void *arg)
+{
+    (void)arg;
+    s_fade_step++;
+    uint32_t duty = 255u * (uint32_t)(s_fade_step * s_fade_step) / (FADE_STEPS * FADE_STEPS);
+    bsp_backlight_set((uint8_t)duty);
+    if (s_fade_step >= FADE_STEPS) {
+        esp_timer_stop(s_fade_timer);
+    }
+}
+
+void bsp_backlight_fade_in(uint32_t ms)
+{
+    if (!s_fade_timer) {
+        const esp_timer_create_args_t args = {.callback = fade_cb, .name = "bl_fade"};
+        if (esp_timer_create(&args, &s_fade_timer) != ESP_OK) {
+            bsp_backlight_set(255);
+            return;
+        }
+    }
+    esp_timer_stop(s_fade_timer);   // harmless if not running
+    s_fade_step = 0;
+    uint64_t period_us = (uint64_t)ms * 1000u / FADE_STEPS;
+    if (esp_timer_start_periodic(s_fade_timer, period_us ? period_us : 1000u) != ESP_OK) {
+        bsp_backlight_set(255);
+    }
+}
+
 // ---- touch (vendor i2c_bsp.c + lcd_touch_bsp.c) -------------------------------------------------------------------
 static esp_err_t touch_init(void)
 {
@@ -173,7 +207,9 @@ esp_err_t bsp_display_start(void)
     static lv_disp_drv_t disp_drv;
     static lv_indev_drv_t indev_drv;
 
-    ESP_RETURN_ON_ERROR(backlight_init(255), TAG, "backlight");
+    // Change from vendor: start with the backlight off (vendor: 255). Until the app has drawn its first frame the
+    // panel shows leftover memory and then LVGL's white default screen; the app calls bsp_backlight_fade_in().
+    ESP_RETURN_ON_ERROR(backlight_init(0), TAG, "backlight");
 
     const spi_bus_config_t buscfg = {
         .data0_io_num = BSP_LCD_PIN_D0,
@@ -235,6 +271,7 @@ esp_err_t bsp_display_start(void)
     indev_drv.disp = disp;
     indev_drv.read_cb = lvgl_touch_cb;
     lv_indev_drv_register(&indev_drv);
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);   // change from vendor: no white first frame
 
     // Change from vendor: recursive mutex, so code holding the lock (e.g. inside an LVGL timer) can call helpers
     // that also lock.

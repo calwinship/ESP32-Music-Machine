@@ -37,3 +37,10 @@
 #define BSP_I2S_PIN_WS       GPIO_NUM_40   // S3_I2S_DAC_LRCK/WS -> CH445P S2C
 #define BSP_I2S_PIN_DOUT     GPIO_NUM_41   // S3_I2S_DAC_DIN -> CH445P S2B
 #define BSP_DAC_SWITCH_PIN   GPIO_NUM_0    // I2S_SWITCH_IN (CH445P IN): high = DAC driven by the S3. Strapping pin
+
+// Supply sense: BATT_ADC = the "5V" net through a 10k/10k divider (R62/R63, SCH p4), on ADC1 channel 0. Whether "5V"
+// is the cell itself on battery or a boosted rail is UNVERIFIED (the battery/charger circuit is not in the schematic).
+#define BSP_BATT_ADC_PIN     GPIO_NUM_1
+#define BSP_BATT_ADC_UNIT    ADC_UNIT_1
+#define BSP_BATT_ADC_CHANNEL ADC_CHANNEL_0
+#define BSP_BATT_DIVIDER     2
