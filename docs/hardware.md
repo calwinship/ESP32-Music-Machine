@@ -183,7 +183,7 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 
 - Flash size: `sdkconfig.defaults` says 8 MB, but the committed `sdkconfig` says **16 MB**, which matches the W25Q128 and the BIN-S3 header.
   `sdkconfig` takes precedence when it exists.
-- `partitions.csv`: nvs 0x6000, phy_init 0x1000, **factory app 8 MB**.
+- `partitions.csv`: nvs 0x6000, phy_init 0x1000, **factory app 8 MB**. (Our firmware/s3 now uses its own layout: see `firmware/s3/partitions.csv`.)
 - Console: primary UART0 at 115200 (`CONFIG_ESP_CONSOLE_UART_DEFAULT`) **plus secondary USB-Serial-JTAG**
   (`CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y`). UART0 has no visible route (see GPIO43/44). **Verified 2026-11-14:** boot and app
   logs arrive on the native-USB port (`/dev/cu.usbmodem101`, 303A:1001). The same console setting appears in all 8 demos.
@@ -212,6 +212,7 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 | 2026-11-14 | firmware/s3 UI: arc + number shown; clockwise up / anticlockwise down; tap resets to 50; clean rendering | user: "yes to all" |
 | 2026-11-15 | **DAC at 48 kHz, no MCLK** (PLL from BCK, `Pcm5100a.pdf` Table 11). `docs/vendor/work/07_Audio_Rate48`: copy of the 07 playback variant, only change `I2S_SAMPLE_RATE` 44100→48000 + clip (Sporting Paddy 0:10–0:40) resampled to 48 kHz s16 stereo; vendor left-justified format and volume 10 kept; IDF v5.5.6. Clean boot, `main: audio start` | user: normal speed and pitch, no crackle/dropouts |
 | 2026-11-15 | **DAC at 32 kHz, no MCLK**: same test, `07_Audio_Rate32` (32000, clip resampled to 32 kHz) | user: normal speed and pitch, no crackle/dropouts |
+| 2026-11-15 | **firmware/s3 partition table v2**: nvs 0x9000/24K, phy_init 0xf000/4K, factory 0x10000/3M, `tunes` data/fat 0x310000/0xCF0000 (13248K) readonly. Bootloader prints all 4 rows; app boots (`app: ready`). Format chosen for tunes: MP3 CBR 32 kbps mono, 32 kHz (user listening test; Opus 24 kbps rejected as "squeaky") | `./flash` boot log; user: UI "all as before" |
 
 ## Known quirks in the vendor demo code (for later)
 

@@ -1,5 +1,8 @@
-# Same layout as the vendor demos (verified on this board). 16 MB flash; app slot 8 MB, rest unused for now.
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     ,         0x6000,
-phy_init, data, phy,     ,         0x1000,
-factory,  app,  factory, ,         8M,
+# 16 MB flash. Offsets are explicit so NVS never moves when the layout changes (play history lives there).
+# factory: 3 MB app slot (app ~0.7 MB with the audio decoders; room for Wi-Fi/TLS later).
+# tunes: read-only raw FAT image, written only by ./sync-tunes (never by ./flash). Mounted at /tunes.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  3M,
+tunes,    data, fat,     0x310000, 0xCF0000, readonly
