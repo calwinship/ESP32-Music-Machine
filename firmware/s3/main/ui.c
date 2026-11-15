@@ -7,6 +7,7 @@
 #include "bsp/bsp.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "logic/battery.h"
 #include "logic/controls.h"
 #include "player_task.h"
 #include "settings.h"
@@ -20,8 +21,9 @@ static const char *TAG = "ui";
 #define LIST_IDLE_MS      6000
 #define REVEAL_TIMEOUT_MS 1500   // light the screen by then even if the player hasn't reported a tune
 #define FADE_IN_MS        180
-#define SUPPLY_SHOW_MS    2000   // TEMPORARY supply readout: screen update period
-#define SUPPLY_LOG_MS     10000  //   and log period
+#define BATTERY_SAMPLE_MS 2000
+#define BATTERY_LOG_MS    60000
+#define MAX_SPEED_PILLS   5      // more speeds than this: one "Speed n/N" button that steps through them
 
 // Tune list geometry: big rows (a finger is ~50 px on this screen), the chosen row in the centre.
 #define ROW_H             64
@@ -34,6 +36,10 @@ static const char *TAG = "ui";
 #define COL_TEXT          lv_color_hex(0xF2F2F2)
 #define COL_DIM           lv_color_hex(0x8C8C8C)
 #define COL_HINT          lv_color_hex(0x5A5A5A)
+#define COL_BATT          lv_color_hex(0x6A6A6A)   // battery outline: subtle
+#define COL_PLUGGED       lv_color_hex(0x2EC4B6)
+#define COL_LOW           lv_color_hex(0xF2A33A)
+#define COL_EMPTY         lv_color_hex(0xFF5A5F)
 #define COL_RING_BG       lv_color_hex(0x262626)
 #define COL_ACCENT        lv_color_hex(0xF2A33A)   // warm amber
 #define COL_VOLUME        lv_color_hex(0xB388FF)   // violet: the ring while in volume mode
@@ -53,9 +59,13 @@ static lv_color_t speed_colour(uint8_t index, uint8_t count)
 }
 
 // Touched only from the LVGL task (timers and event callbacks).
-static lv_obj_t *s_scr, *s_ring, *s_speed, *s_title, *s_time, *s_sub, *s_icon, *s_glow_outer, *s_glow_inner;
-static lv_obj_t *s_hint_prev, *s_hint_next, *s_hint_tunes;
-static lv_obj_t *s_supply;          // TEMPORARY: supply voltage readout, to find out what BATT_ADC measures
+static lv_obj_t *s_scr, *s_ring, *s_title, *s_time, *s_sub, *s_icon, *s_glow_outer, *s_glow_inner;
+static lv_obj_t *s_speeds;          // row of speed buttons
+static uint8_t s_pill_count;
+static bool s_pill_steps;           // one button that steps through many speeds
+static lv_obj_t *s_list_btn;
+static lv_obj_t *s_batt, *s_batt_fill, *s_batt_bolt;
+static battery_t s_battery;
 static lv_obj_t *s_list, *s_col;
 static lv_obj_t **s_rows;
 static uint16_t s_row_count;
@@ -285,15 +295,8 @@ static void screen_event(lv_event_t *e)
         s_gesture_this_press = false;
         break;
     case LV_EVENT_GESTURE: {
-        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
+        // Swipes do nothing on the main screen, but a swipe must not count as a tap (play/pause) either.
         s_gesture_this_press = true;
-        if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
-            ESP_LOGI(TAG, "swipe %s", dir == LV_DIR_LEFT ? "left: next speed" : "right: previous speed");
-            player_task_change_speed(dir == LV_DIR_LEFT ? 1 : -1);
-        } else if (dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
-            ESP_LOGI(TAG, "swipe %s: tune list", dir == LV_DIR_TOP ? "up" : "down");
-            list_open();
-        }
         break;
     }
     case LV_EVENT_SHORT_CLICKED:   // not sent after a long press
@@ -359,32 +362,107 @@ static void controls_poll(lv_timer_t *t)
 }
 
 // ---- drawing ------------------------------------------------------------------------------------------------
-static void hints_update(const player_status_t *st)
+// Speed buttons: one pill per speed ("Slow  Medium  Fast"); the current one filled in its speed colour.
+static void pill_event(lv_event_t *e)
 {
-    bool prev, next;
-    speed_hints(st->speed, st->speed_count, &prev, &next);
-    // Each side's chevron is tinted with the colour of the speed it leads to.
-    if (prev) {
-        lv_obj_set_style_line_color(s_hint_prev, speed_colour(st->speed - 1, st->speed_count), 0);
-        lv_obj_clear_flag(s_hint_prev, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(s_hint_prev, LV_OBJ_FLAG_HIDDEN);
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || s_list_open) {
+        return;
     }
-    if (next) {
-        lv_obj_set_style_line_color(s_hint_next, speed_colour(st->speed + 1, st->speed_count), 0);
-        lv_obj_clear_flag(s_hint_next, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(s_hint_next, LV_OBJ_FLAG_HIDDEN);
+    uint8_t i = (uint8_t)(uintptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    uint8_t to = s_pill_steps ? (uint8_t)((s_shown.speed + 1u) % s_shown.speed_count) : i;
+    ESP_LOGI(TAG, "speed button: %u of %u", (unsigned)to + 1u, (unsigned)s_shown.speed_count);
+    player_task_play_speed(to);
+}
+
+static void speeds_build(uint8_t count)
+{
+    lv_obj_clean(s_speeds);
+    s_pill_steps = count > MAX_SPEED_PILLS;
+    s_pill_count = count <= 1 ? 0 : s_pill_steps ? 1 : count;
+    for (uint8_t i = 0; i < s_pill_count; i++) {
+        lv_obj_t *p = lv_obj_create(s_speeds);
+        lv_obj_remove_style_all(p);
+        lv_obj_set_size(p, LV_SIZE_CONTENT, 36);
+        lv_obj_set_style_pad_hor(p, 13, 0);
+        lv_obj_set_style_radius(p, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(p, COL_TEXT, LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(p, LV_OPA_20, LV_STATE_PRESSED);
+        lv_obj_set_ext_click_area(p, 6);   // 48 px tall to the finger
+        lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_user_data(p, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(p, pill_event, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *l = lv_label_create(p);
+        lv_obj_set_style_text_font(l, UI_FONT_SMALL, 0);
+        const char *name = speed_name(i, count);
+        if (name && !s_pill_steps) {
+            lv_label_set_text(l, name);
+        } else {
+            lv_label_set_text_fmt(l, "%u", (unsigned)i + 1u);
+        }
+        lv_obj_center(l);
     }
 }
 
-static bool first_supply_due(uint32_t now, uint32_t *last, uint32_t period)
+static void speeds_style(uint8_t speed, uint8_t count)
 {
-    if (*last && now - *last < period) {
-        return false;
+    for (uint8_t i = 0; i < s_pill_count; i++) {
+        lv_obj_t *p = lv_obj_get_child(s_speeds, i);
+        lv_obj_t *l = lv_obj_get_child(p, 0);
+        bool on = s_pill_steps || i == speed;
+        lv_color_t c = speed_colour(s_pill_steps ? speed : i, count);
+        lv_obj_set_style_bg_color(p, c, 0);
+        lv_obj_set_style_bg_opa(p, on ? LV_OPA_30 : LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_color(l, on ? c : COL_DIM, 0);
+        if (s_pill_steps) {
+            lv_label_set_text_fmt(l, "Speed %u/%u", (unsigned)speed + 1u, (unsigned)count);
+        }
     }
-    *last = now ? now : 1;
-    return true;
+}
+
+static void list_button_event(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED && !s_list_open) {
+        list_open();
+    }
+}
+
+// Battery icon: outline, a fill for the level, a small bolt when on USB (the pin then reads USB, not the cell).
+static void battery_show(void)
+{
+    static battery_state_t shown;
+    static bool any;
+    static uint32_t logged_ms;
+    uint32_t mv = bsp_supply_mv();
+    battery_state_t b = battery_update(&s_battery, mv);
+    uint32_t now = lv_tick_get();
+    if (!b.known) {
+        return;
+    }
+    bool changed = !any || b.plugged != shown.plugged || b.level != shown.level;
+    if (changed || now - logged_ms >= BATTERY_LOG_MS) {
+        if (b.plugged) {
+            ESP_LOGI(TAG, "battery: on USB (%u mV)", (unsigned)mv);
+        } else {
+            ESP_LOGI(TAG, "battery: %u mV, level %u%%", (unsigned)mv, (unsigned)b.level);
+        }
+        logged_ms = now;
+    }
+    if (!changed) {
+        return;
+    }
+    any = true;
+    shown = b;
+    lv_obj_clear_flag(s_batt, LV_OBJ_FLAG_HIDDEN);
+    if (b.plugged) {
+        lv_obj_add_flag(s_batt_fill, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_batt_bolt, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_add_flag(s_batt_bolt, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_batt_fill, LV_OBJ_FLAG_HIDDEN);
+    lv_coord_t w = (lv_coord_t)(b.level * 18u / 100u);
+    lv_obj_set_width(s_batt_fill, w < 2 ? 2 : w);
+    lv_obj_set_style_bg_color(s_batt_fill, b.level <= 10 ? COL_EMPTY : b.level <= 20 ? COL_LOW : COL_DIM, 0);
 }
 
 static void ui_refresh(lv_timer_t *t)
@@ -418,24 +496,19 @@ static void ui_refresh(lv_timer_t *t)
         text_mmss(buf, sizeof(buf), st.elapsed_ms);
         lv_label_set_text(s_time, buf);
     }
-    bool speed_changed = first || st.speed != s_shown.speed || st.speed_count != s_shown.speed_count;
+    bool speed_changed = first || st.speed != s_shown.speed || st.speed_count != s_shown.speed_count ||
+                         st.tune_id != s_shown.tune_id;
+    if (first || st.speed_count != s_shown.speed_count || st.tune_id != s_shown.tune_id) {
+        speeds_build(st.speed_count);
+    }
     if (speed_changed) {
-        const char *name = speed_name(st.speed, st.speed_count);
-        lv_obj_set_style_text_color(s_speed, speed_colour(st.speed, st.speed_count), 0);
-        if (st.speed_count <= 1) {
-            lv_label_set_text(s_speed, "");
-        } else if (name) {
-            lv_label_set_text_fmt(s_speed, "%s  %u/%u", name, (unsigned)st.speed + 1u, (unsigned)st.speed_count);
-        } else {
-            lv_label_set_text_fmt(s_speed, "Speed %u/%u", (unsigned)st.speed + 1u, (unsigned)st.speed_count);
-        }
-        hints_update(&st);
+        speeds_style(st.speed, st.speed_count);
     }
     if (first || st.tune_count != s_shown.tune_count) {
         if (st.tune_count > 1) {
-            lv_obj_clear_flag(s_hint_tunes, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_list_btn, LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_add_flag(s_hint_tunes, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_list_btn, LV_OBJ_FLAG_HIDDEN);
         }
     }
 
@@ -464,14 +537,12 @@ static void ui_refresh(lv_timer_t *t)
     s_shown = st;
     first = false;
 
-    // TEMPORARY: supply voltage on screen and in the log, until we know whether it tracks the battery.
-    static uint32_t supply_shown_ms, supply_logged_ms;
-    if (first_supply_due(now, &supply_shown_ms, SUPPLY_SHOW_MS)) {
-        uint32_t mv = bsp_supply_mv();
-        lv_label_set_text_fmt(s_supply, "%u.%02u V", (unsigned)(mv / 1000u), (unsigned)(mv % 1000u / 10u));
-        if (first_supply_due(now, &supply_logged_ms, SUPPLY_LOG_MS)) {
-            ESP_LOGI(TAG, "supply %u mV", (unsigned)mv);
-        }
+    static uint32_t battery_ms;
+    static bool battery_once;
+    if (!battery_once || now - battery_ms >= BATTERY_SAMPLE_MS) {
+        battery_once = true;
+        battery_ms = now;
+        battery_show();
     }
 
     // Boot: light the screen only once it shows the tune (or an error), so there's no flash of an empty or white
@@ -502,27 +573,35 @@ static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color
     return l;
 }
 
-// A thin rounded chevron drawn as a line (no font glyph needed). `pts` must stay valid: LVGL keeps the pointer.
-static lv_obj_t *chevron(lv_obj_t *parent, const lv_point_t *pts, lv_color_t color, lv_coord_t x, lv_coord_t y)
+// A thin rounded line drawn with lv_line (no font glyph needed). `pts` must stay valid: LVGL keeps the pointer.
+static lv_obj_t *line(lv_obj_t *parent, const lv_point_t *pts, uint16_t n, lv_coord_t width, lv_color_t color,
+                      lv_align_t align, lv_coord_t x, lv_coord_t y)
 {
     lv_obj_t *l = lv_line_create(parent);
-    lv_line_set_points(l, pts, 3);
-    lv_obj_set_style_line_width(l, 3, 0);
+    lv_line_set_points(l, pts, n);
+    lv_obj_set_style_line_width(l, width, 0);
     lv_obj_set_style_line_rounded(l, true, 0);
     lv_obj_set_style_line_color(l, color, 0);
-    lv_obj_set_style_line_opa(l, LV_OPA_60, 0);
-    lv_obj_align(l, LV_ALIGN_CENTER, x, y);
+    lv_obj_align(l, align, x, y);
     lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE);
     return l;
 }
 
+static lv_obj_t *plain(lv_obj_t *parent)   // an lv_obj with no theme styling, not clickable or scrollable
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    return o;
+}
+
 void ui_start(int32_t volume)
 {
-    static const lv_point_t pts_left[] = {{8, 0}, {1, 8}, {8, 16}};
-    static const lv_point_t pts_right[] = {{1, 0}, {8, 8}, {1, 16}};
-    static const lv_point_t pts_down[] = {{1, 1}, {10, 8}, {19, 1}};
+    static const lv_point_t pts_bar[] = {{0, 0}, {22, 0}};
+    static const lv_point_t pts_bolt[] = {{11, 0}, {7, 5}, {12, 5}, {8, 10}};
 
     s_volume = volume;
+    battery_init(&s_battery);
     s_start_ms = lv_tick_get();
     knob_seek_init(&s_seek);
     uint32_t id, ms;
@@ -559,7 +638,7 @@ void ui_start(int32_t volume)
     const lv_coord_t sizes[2] = {280, 190};
     for (int i = 0; i < 2; i++) {
         lv_obj_set_size(discs[i], sizes[i], sizes[i]);
-        lv_obj_align(discs[i], LV_ALIGN_CENTER, 0, -30);
+        lv_obj_align(discs[i], LV_ALIGN_CENTER, 0, -20);
         lv_obj_set_style_radius(discs[i], LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_bg_opa(discs[i], LV_OPA_10, 0);
         lv_obj_set_style_border_width(discs[i], 0, 0);
@@ -568,30 +647,59 @@ void ui_start(int32_t volume)
     lv_obj_move_background(s_glow_inner);
     lv_obj_move_background(s_glow_outer);
 
-    s_speed = label(s_scr, UI_FONT_SMALL, COL_ACCENT, -130);
+    // Battery, top centre: small and dim.
+    s_batt = plain(s_scr);
+    lv_obj_set_size(s_batt, 25, 12);
+    lv_obj_align(s_batt, LV_ALIGN_CENTER, 0, -157);
+    lv_obj_t *body = plain(s_batt);
+    lv_obj_set_size(body, 22, 12);
+    lv_obj_set_style_border_width(body, 1, 0);
+    lv_obj_set_style_border_color(body, COL_BATT, 0);
+    lv_obj_set_style_border_opa(body, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(body, 3, 0);
+    lv_obj_t *nub = plain(s_batt);
+    lv_obj_set_size(nub, 2, 4);
+    lv_obj_set_pos(nub, 23, 4);
+    lv_obj_set_style_bg_color(nub, COL_BATT, 0);
+    lv_obj_set_style_bg_opa(nub, LV_OPA_COVER, 0);
+    s_batt_fill = plain(body);
+    lv_obj_set_size(s_batt_fill, 2, 8);
+    lv_obj_set_pos(s_batt_fill, 1, 1);
+    lv_obj_set_style_radius(s_batt_fill, 1, 0);
+    lv_obj_set_style_bg_opa(s_batt_fill, LV_OPA_COVER, 0);
+    s_batt_bolt = line(body, pts_bolt, 4, 2, COL_PLUGGED, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(s_batt, LV_OBJ_FLAG_HIDDEN);   // until the first reading
+
+    // Speed buttons under the battery.
+    s_speeds = plain(s_scr);
+    lv_obj_set_size(s_speeds, 250, 48);
+    lv_obj_align(s_speeds, LV_ALIGN_CENTER, 0, -124);
+    lv_obj_set_flex_flow(s_speeds, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_speeds, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_speeds, 6, 0);
+
 #if UI_HAVE_ICONS
-    s_icon = label(s_scr, UI_FONT_ICON, COL_ACCENT, -88);
+    s_icon = label(s_scr, UI_FONT_ICON, COL_ACCENT, -76);
 #endif
-    s_title = label(s_scr, UI_FONT_TEXT, COL_TEXT, -36);
+    s_title = label(s_scr, UI_FONT_TEXT, COL_TEXT, -26);
     lv_obj_set_width(s_title, 290);
     lv_label_set_long_mode(s_title, LV_LABEL_LONG_WRAP);
-    s_time = label(s_scr, UI_FONT_TIME, COL_TEXT, 24);
-    s_sub = label(s_scr, UI_FONT_SMALL, COL_DIM, 70);
-    s_supply = label(s_scr, UI_FONT_SMALL, COL_HINT, -156);
+    s_time = label(s_scr, UI_FONT_TIME, COL_TEXT, 34);
+    s_sub = label(s_scr, UI_FONT_SMALL, COL_DIM, 78);
 
-    // Swipe hints, dim: left/right of the time when there's a speed that way; "Tunes" + down arrow at the bottom.
-    s_hint_prev = chevron(s_scr, pts_left, COL_HINT, -148, 24);
-    s_hint_next = chevron(s_scr, pts_right, COL_HINT, 148, 24);
-    s_hint_tunes = lv_obj_create(s_scr);
-    lv_obj_remove_style_all(s_hint_tunes);
-    lv_obj_set_size(s_hint_tunes, 80, 44);
-    lv_obj_align(s_hint_tunes, LV_ALIGN_CENTER, 0, 130);
-    lv_obj_clear_flag(s_hint_tunes, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *tunes = label(s_hint_tunes, UI_FONT_SMALL, COL_HINT, -8);
-    lv_label_set_text(tunes, "Tunes");
-    chevron(s_hint_tunes, pts_down, COL_HINT, 0, 13);
+    // Tune list button at the bottom: three thin lines, no background; dims while pressed.
+    s_list_btn = lv_obj_create(s_scr);
+    lv_obj_remove_style_all(s_list_btn);
+    lv_obj_set_size(s_list_btn, 64, 48);
+    lv_obj_align(s_list_btn, LV_ALIGN_CENTER, 0, 126);
+    lv_obj_clear_flag(s_list_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_opa(s_list_btn, LV_OPA_40, LV_STATE_PRESSED);
+    for (int i = -1; i <= 1; i++) {
+        line(s_list_btn, pts_bar, 2, 2, COL_DIM, LV_ALIGN_CENTER, 0, (lv_coord_t)(i * 7));
+    }
+    lv_obj_add_event_cb(s_list_btn, list_button_event, LV_EVENT_CLICKED, NULL);
 
-    // Tune list: full screen on top, hidden until a swipe up/down. Rows are built on first open.
+    // Tune list: full screen on top, hidden until the list button. Rows are built on first open.
     s_list = lv_obj_create(s_scr);
     lv_obj_remove_style_all(s_list);
     lv_obj_set_size(s_list, BSP_LCD_H_RES, BSP_LCD_V_RES);

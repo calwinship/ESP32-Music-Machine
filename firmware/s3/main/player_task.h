@@ -27,8 +27,8 @@ typedef struct {
 void player_task_start(bool resume, uint32_t resume_tune_id, uint32_t resume_ms);
 // All safe from any task (e.g. LVGL callbacks). Commands are dropped if the queue is full.
 void player_task_tap(void);                     // play/pause; after the end: restart from the first marker
-void player_task_restart_speed(void);           // back to the start of the current play, and play
-void player_task_change_speed(int32_t delta);   // +1 next play, -1 previous; keeps play/pause
+void player_task_restart_speed(void);           // play the current speed from its start
+void player_task_play_speed(uint8_t index);     // play this speed (0 = slowest) from its start
 void player_task_seek(int32_t clicks);          // +/- SEEK_STEP_MS per click (logic/controls.h)
 void player_task_select_tune(uint16_t tune);    // play this tune from its first marker
 void player_status_get(player_status_t *out);   // consistent snapshot

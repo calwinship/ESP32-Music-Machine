@@ -75,7 +75,7 @@ static void send(cmd_type_t type, int32_t arg)
 
 void player_task_tap(void) { send(CMD_TAP, 0); }
 void player_task_restart_speed(void) { send(CMD_RESTART_SPEED, 0); }
-void player_task_change_speed(int32_t delta) { send(CMD_SPEED, delta); }
+void player_task_play_speed(uint8_t index) { send(CMD_SPEED, index); }
 void player_task_seek(int32_t clicks) { send(CMD_SEEK, clicks); }
 void player_task_select_tune(uint16_t tune) { send(CMD_SELECT, tune); }
 
@@ -356,7 +356,7 @@ static void handle(const cmd_t *c)
         }
         speed_t sp;
         speed_at(&s_tune, s_pl.position, &sp);
-        int32_t want = c->type == CMD_SPEED ? (int32_t)sp.index + c->arg : sp.index;
+        int32_t want = c->type == CMD_SPEED ? c->arg : sp.index;   // absolute: two quick taps can't overshoot
         want = want < 0 ? 0 : want >= sp.count ? sp.count - 1 : want;
         uint32_t from = s_pl.position;
         if (s_pl.state == PLAYER_PLAYING) {
@@ -365,7 +365,7 @@ static void handle(const cmd_t *c)
         if (!jump_to(speed_start(&s_tune, (uint8_t)want))) {
             break;
         }
-        if (c->type == CMD_RESTART_SPEED && s_pl.state != PLAYER_PLAYING) {
+        if (s_pl.state != PLAYER_PLAYING) {
             player_toggle(&s_pl);   // paused (or ended -> paused by the jump) -> playing
             s_fade_done = 0;
         }

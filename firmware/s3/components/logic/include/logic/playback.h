@@ -56,9 +56,6 @@ uint32_t speed_start(const tune_info_t *t, uint8_t index);   // index clamped to
 uint16_t speed_permille(const speed_t *s, uint32_t position); // progress through the speed, 0..1000
 // "Slow"/"Fast" for 2 speeds, "Slow"/"Medium"/"Fast" for 3, "" for 1; NULL otherwise (caller shows a number).
 const char *speed_name(uint8_t index, uint8_t count);
-// Swipe hints: is there a slower (*prev) / faster (*next) speed to swipe to? Changing speed clamps, so the first
-// speed has no prev and the last no next; a single-speed tune has neither.
-void speed_hints(uint8_t index, uint8_t count, bool *prev, bool *next);
 
 // Resume: find the tune with this ID and turn a saved position into a sample. A position at or past the end
 // (saved when the tune ended, or the tune got shorter after a re-sync) gives the tune's first marker. False if the
