@@ -11,6 +11,8 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 - `./sync-tunes [--no-flash] [--accept "<title>"] [--accept-all]`: `recordings/*.m4a` → MP3 + `INDEX.BIN` → FAT image →
   writes **only** the S3 `tunes` partition (~2–3 min). Refuses if it doesn't fit. Cache/image in gitignored `build-tunes/`
 - `. tools/idf_env.sh`: ESP-IDF shell for manual `idf.py` use
+- `tools/gen_fonts.sh`: regenerate `firmware/s3/main/fonts/` (Latin-1 text with fadas, 64 px digits, tune icons from
+  `tools/icons.txt`) with `npx lv_font_conv@1.5.2`; output is committed, so only needed when glyphs change
 - `tools/fetch_vendor.sh`: re-create the gitignored `docs/vendor/` (Waveshare demos, schematic, datasheets), checksum-verified
 
 ## Toolchain (pinned)
@@ -30,6 +32,7 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 - `recordings/`: the user's `.m4a` memos (gitignored; file name = title). `recordings/not-synced/` is ignored by sync
 - `markers/<title>.txt` (git-tracked): start time of each play. sync-tunes only creates missing files, after the user
   confirms (`--accept`); **never overwrite or edit one without asking.** Format: `markers/README.md`
+- `markers/` files may also set `icon:` (name from `tools/icons.txt`) and `colour: #RRGGBB`; both go into INDEX.BIN v2
 - Tunes: MP3 CBR 32 kbps mono 32 kHz (user's listening test, 2026-11-15); tune ID = FNV-1a of the normalised title
 - `docs/backups.md`: factory S3 flash backup checksum (file in `~/esp/backups/`, outside git)
 

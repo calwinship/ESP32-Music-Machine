@@ -10,7 +10,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent / 'tools'))
 import sync_tunes as st  # noqa: E402
 
-FIXTURE = HERE / 'fixtures' / 'index_v1.bin'
+FIXTURE = HERE / 'fixtures' / 'index_v2.bin'
 
 
 class Titles(unittest.TestCase):
@@ -99,6 +99,37 @@ class Markers(unittest.TestCase):
             if len(list(Path(d).glob('*.txt'))) == 2:  # case-insensitive filesystems merge the two names
                 with self.assertRaises(st.SyncError):
                     st.find_marker_files(Path(d))
+
+
+class Theme(unittest.TestCase):
+    ICONS = {'leaf': 0xF06C, 'music': 0xF001}
+
+    def test_icon_and_colour_lines(self):
+        text = '# Clare Jig\n0:06.8\nicon: Leaf   # a comment\ncolour: #2ec4b6\n1:41.0\n'
+        tf = st.parse_tune_file(text, 200000, 'f', self.ICONS)
+        self.assertEqual((tf.starts, tf.icon, tf.colour), ([6800, 101000], 'leaf', 0x2EC4B6))
+        self.assertEqual(st.parse_tune_file('color: 102030\n', 200000, 'f').colour, 0x102030)
+
+    def test_bad_theme_lines_name_the_line(self):
+        bad = {'icon: spaceship\n': 'f:1', '0:01\nicon: leaf\nicon: music\n': 'f:3', 'colour: red\n': 'f:1',
+               'colour: #123\n': 'f:1', 'tempo: 120\n': 'f:1'}
+        for text, where in bad.items():
+            with self.assertRaises(st.SyncError) as cm:
+                st.parse_tune_file(text, 200000, 'f', self.ICONS)
+            self.assertIn(where, str(cm.exception))
+
+    def test_icon_list_matches_the_font(self):
+        icons = st.load_icons()
+        self.assertEqual(icons['music'], 0xF001)
+        self.assertIn(st.DEFAULT_ICON, icons)
+        self.assertTrue(all(0xE000 <= cp <= 0xF8FF for cp in icons.values()))
+        self.assertEqual(len(set(icons.values())), len(icons))
+
+    def test_default_colour_is_stable_and_bright(self):
+        c = st.default_colour(st.tune_id('Clare Jig'))
+        self.assertEqual(c, st.default_colour(st.tune_id('clare  jig')))
+        self.assertGreaterEqual(max(c >> 16, (c >> 8) & 255, c & 255), 230)
+        self.assertNotEqual(c, st.default_colour(st.tune_id('Silver Spear')))
 
 
 class Play1Proposal(unittest.TestCase):
@@ -194,7 +225,7 @@ class Index(unittest.TestCase):
 
     def test_golden_fixture_is_unchanged(self):
         # The C parser in components/logic reads the same file. Regenerate only on a deliberate format change:
-        #   python3 tools/sync_tunes.py --write-test-fixture tests/host/fixtures/index_v1.bin
+        #   python3 tools/sync_tunes.py --write-test-fixture tests/host/fixtures/index_v2.bin
         self.assertEqual(st.write_index(st.fixture_tunes()), FIXTURE.read_bytes())
 
     def test_corruption_is_detected(self):

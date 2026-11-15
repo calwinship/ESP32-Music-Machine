@@ -1,4 +1,4 @@
-// INDEX.BIN parser (plain C, no ESP-IDF headers; host-tested against tests/host/fixtures/index_v1.bin).
+// INDEX.BIN parser (plain C, no ESP-IDF headers; host-tested against tests/host/fixtures/index_v2.bin).
 // The format is written by tools/sync_tunes.py (write_index): little-endian, CRC32 at the end. tune_index_open()
 // checks every byte the getters will read, so a corrupt or truncated file is rejected up front.
 #pragma once
@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define TUNE_INDEX_VERSION     1
+#define TUNE_INDEX_VERSION     2   // v2 added icon + colour
 #define TUNE_INDEX_MAX_MARKERS 8
 #define TUNE_INDEX_MAX_TITLE   100   // bytes of UTF-8
 #define TUNE_INDEX_MAX_NAME    12    // 8.3 file name
@@ -39,6 +39,8 @@ typedef struct {
     uint16_t seconds_count;      // = ceil(total_samples / sample_rate)
     uint8_t channels;
     uint8_t marker_count;
+    uint16_t icon;               // FontAwesome codepoint (U+E000..U+F8FF), drawn with the icon font
+    uint32_t colour;             // tune theme colour, 0x00RRGGBB
     char file_name[TUNE_INDEX_MAX_NAME + 1];
     char title[TUNE_INDEX_MAX_TITLE + 1];
     uint32_t markers_ms[TUNE_INDEX_MAX_MARKERS];  // start of each play, increasing

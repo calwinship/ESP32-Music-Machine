@@ -15,6 +15,7 @@ Run through ./sync-tunes (IDF Python env). Steps:
 Only the Python standard library is used here, so tests/host/test_sync_tunes.py runs with any python3.
 """
 import argparse
+import colorsys
 import datetime
 import hashlib
 import math
@@ -35,6 +36,8 @@ MARKERS = ROOT / 'markers'
 BUILD = ROOT / 'build-tunes'
 PARTITIONS_CSV = ROOT / 'firmware' / 's3' / 'partitions.csv'
 PARTITION_NAME = 'tunes'
+ICONS_FILE = ROOT / 'tools' / 'icons.txt'
+DEFAULT_ICON = 'music'
 RECORDING_EXTS = ('.m4a',)
 
 # Tune format, chosen 2026-11-15 by listening test: MP3 CBR, mono, 32 kHz (a DAC rate verified on the board).
@@ -50,10 +53,10 @@ SECTOR = 4096               # FAT sector = flash sector, as IDF's fatfs_create_r
 ROOT_ENTRIES = 512          # fatfsgen default
 
 INDEX_MAGIC = b'TIDX'
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 CODEC_MP3 = 1
 INDEX_HEADER = struct.Struct('<4sHHB3xI')            # magic, version, tune count, codec, total length (incl. CRC)
-INDEX_RECORD = struct.Struct('<IIIIIHHHBBBBH')      # see write_index()
+INDEX_RECORD = struct.Struct('<IIIIIHHHBBBBHI')     # see write_index()
 INDEX_SECOND = struct.Struct('<II')                 # byte offset, frame number where decoding starts
 
 
@@ -109,12 +112,62 @@ def format_time_ms(ms):
     return f'{tenths // 600}:{(tenths % 600) / 10:04.1f}'
 
 
-def parse_markers(text, duration_ms, where):
-    """Strictly parse a marker file: one start time per line, '#' starts a comment. Returns sorted ms list."""
-    starts = []
+def load_icons(path=ICONS_FILE):
+    """tools/icons.txt -> {name: FontAwesome codepoint}. The same list builds the device's icon font."""
+    icons = {}
+    for raw in path.read_text(encoding='utf-8').splitlines():
+        line = raw.split('#', 1)[0].split()
+        if line:
+            icons[line[0].lower()] = int(line[1], 16)
+    return icons
+
+
+def default_colour(tid):
+    """A tune's colour when its file has none: a bright hue picked from its stable ID (so it never changes)."""
+    r, g, b = colorsys.hsv_to_rgb((tid % 360) / 360.0, 0.6, 0.95)
+    return (round(r * 255) << 16) | (round(g * 255) << 8) | round(b * 255)
+
+
+@dataclass
+class TuneFile:
+    starts: list
+    icon: str = None      # name from tools/icons.txt
+    colour: int = None    # 0xRRGGBB
+
+
+_KEY_RE = re.compile(r'^([A-Za-z]+)\s*:\s*(.*)$')
+_COLOUR_RE = re.compile(r'^#?([0-9A-Fa-f]{6})$')
+
+
+def parse_tune_file(text, duration_ms, where, icons=None):
+    """Strictly parse markers/<title>.txt: one start time per line, plus optional `icon: <name>` and
+    `colour: #RRGGBB` lines (`color` also accepted); '#' followed by a space or at line start is a comment.
+    icons = load_icons() to check icon names (None skips the check)."""
+    out = TuneFile(starts=[])
+    starts = out.starts
     for lineno, raw in enumerate(text.splitlines(), 1):
-        line = raw.split('#', 1)[0].strip()
+        line = re.split(r'(?:^|\s)#(?![0-9A-Fa-f]{6}\b)', raw, maxsplit=1)[0].strip()
         if not line:
+            continue
+        key = _KEY_RE.match(line)
+        if key:
+            name, value = key.group(1).lower(), key.group(2).strip()
+            if name == 'icon':
+                if out.icon is not None:
+                    raise SyncError(f'{where}:{lineno}: icon given twice')
+                value = value.lower()
+                if icons is not None and value not in icons:
+                    raise SyncError(f'{where}:{lineno}: unknown icon {value!r} (see tools/icons.txt)')
+                out.icon = value
+            elif name in ('colour', 'color'):
+                if out.colour is not None:
+                    raise SyncError(f'{where}:{lineno}: colour given twice')
+                m = _COLOUR_RE.match(value)
+                if not m:
+                    raise SyncError(f'{where}:{lineno}: colour must look like #2EC4B6')
+                out.colour = int(m.group(1), 16)
+            else:
+                raise SyncError(f'{where}:{lineno}: unknown setting {name!r} (icon, colour)')
             continue
         try:
             ms = parse_time_ms(line)
@@ -127,7 +180,12 @@ def parse_markers(text, duration_ms, where):
         starts.append(ms)
     if len(starts) > MAX_MARKERS:
         raise SyncError(f'{where}: {len(starts)} start times; at most {MAX_MARKERS}')
-    return starts
+    return out
+
+
+def parse_markers(text, duration_ms, where):
+    """Start times only (see parse_tune_file)."""
+    return parse_tune_file(text, duration_ms, where).starts
 
 
 def marker_file_text(title, starts_ms, today):
@@ -345,24 +403,28 @@ class IndexTune:
     samples_per_frame: int
     markers_ms: list
     seconds: list            # [(byte offset, frame)] one per second
+    icon: int = 0xF001       # FontAwesome codepoint (tools/icons.txt)
+    colour: int = 0xF2A33A   # 0xRRGGBB
 
 
 def write_index(tunes):
     """Little-endian. Header (16 B) | records | CRC32 (zlib) of everything before it.
     Record: u32 record_len, u32 tune_id, u32 sample_rate, u32 total_samples, u32 file_bytes, u16 delay,
     u16 samples_per_frame, u16 seconds_count, u8 channels, u8 marker_count, u8 file_name_len, u8 title_len,
-    u16 reserved=0, file name (ASCII), title (UTF-8), u32 marker ms x marker_count, {u32 offset, u32 frame} x seconds."""
+    u16 icon (FontAwesome codepoint), u32 colour (0x00RRGGBB), file name (ASCII), title (UTF-8),
+    u32 marker ms x marker_count, {u32 offset, u32 frame} x seconds. (v1 had u16 reserved and no colour.)"""
     body = b''
     for t in tunes:
         name, title = t.file_name.encode('ascii'), t.title.encode('utf-8')
-        if len(title) > MAX_TITLE_BYTES or len(name) > 12 or len(t.markers_ms) > MAX_MARKERS:
+        if (len(title) > MAX_TITLE_BYTES or len(name) > 12 or len(t.markers_ms) > MAX_MARKERS
+                or not 0xE000 <= t.icon <= 0xF8FF or not 0 <= t.colour <= 0xFFFFFF):
             raise SyncError(f'{t.title}: title, file name or marker list too long for the index')
         tail = name + title + b''.join(struct.pack('<I', m) for m in t.markers_ms)
         tail += b''.join(INDEX_SECOND.pack(off, fr) for off, fr in t.seconds)
         rec_len = INDEX_RECORD.size + len(tail)
         body += INDEX_RECORD.pack(rec_len, t.tune_id, t.sample_rate, t.total_samples, t.file_bytes, t.delay,
                                   t.samples_per_frame, len(t.seconds), t.channels, len(t.markers_ms), len(name),
-                                  len(title), 0) + tail
+                                  len(title), t.icon, t.colour) + tail
     total = INDEX_HEADER.size + len(body) + 4
     data = INDEX_HEADER.pack(INDEX_MAGIC, INDEX_VERSION, len(tunes), CODEC_MP3, total) + body
     return data + struct.pack('<I', zlib.crc32(data))
@@ -378,7 +440,7 @@ def read_index(data):
     pos, tunes = INDEX_HEADER.size, []
     for _ in range(count):
         (rec_len, tid, sr, total_samples, file_bytes, delay, spf, n_sec, ch, n_mark, name_len, title_len,
-         _res) = INDEX_RECORD.unpack_from(data, pos)
+         icon, colour) = INDEX_RECORD.unpack_from(data, pos)
         p = pos + INDEX_RECORD.size
         name = data[p:p + name_len].decode('ascii'); p += name_len
         title = data[p:p + title_len].decode('utf-8'); p += title_len
@@ -386,7 +448,8 @@ def read_index(data):
         seconds = [INDEX_SECOND.unpack_from(data, p + 8 * i) for i in range(n_sec)]; p += 8 * n_sec
         if p - pos != rec_len:
             raise SyncError('index: record length mismatch')
-        tunes.append(IndexTune(tid, title, name, sr, ch, total_samples, file_bytes, delay, spf, markers, seconds))
+        tunes.append(IndexTune(tid, title, name, sr, ch, total_samples, file_bytes, delay, spf, markers, seconds,
+                               icon, colour))
         pos = p
     if pos != len(data) - 4:
         raise SyncError('index: trailing bytes')
@@ -394,12 +457,12 @@ def read_index(data):
 
 
 def fixture_tunes():
-    """Fixed data for tests/host/fixtures/index_v1.bin, which the C index parser (components/logic) also reads."""
+    """Fixed data for tests/host/fixtures/index_v2.bin, which the C index parser (components/logic) also reads."""
     return [
         IndexTune(tune_id('Clare Jig'), 'Clare Jig', 'T01.MP3', 32000, 1, 96000, 432 * 2, 1105, 1152,
-                  [500, 2000], [(0, 0), (144, 1), (288, 2)]),
+                  [500, 2000], [(0, 0), (144, 1), (288, 2)], icon=0xF06C, colour=0x2EC4B6),
         IndexTune(tune_id('Nóra Chríonna'), 'Nóra Chríonna', 'T02.MP3', 32000, 1, 16000, 288, 1105, 1152,
-                  [], [(0, 0)]),
+                  [], [(0, 0)], icon=0xF186, colour=0xB388FF),
     ]
 
 
@@ -471,6 +534,8 @@ class Tune:
     tune_id: int
     stream: Mp3Stream = None
     markers_ms: list = None
+    icon: str = DEFAULT_ICON
+    colour: int = None
     marker_file: Path = None
     proposal_ms: int = None
 
@@ -538,7 +603,8 @@ def main(argv=None):
         if abs(src_s - got_s) > 0.05:
             raise SyncError(f'{t.title}: duration {got_s:.3f} s after encoding vs {src_s:.3f} s source')
 
-    # 2. markers
+    # 2. markers, icon, colour
+    icons = load_icons()
     marker_files = find_marker_files(MARKERS)
     keys = {tune_key(t.title) for t in tunes}
     accept = {tune_key(a) for a in args.accept}
@@ -553,8 +619,11 @@ def main(argv=None):
         duration_ms = t.stream.total_samples * 1000 // SAMPLE_RATE
         if key in marker_files:
             t.marker_file = marker_files[key]
-            t.markers_ms = parse_markers(t.marker_file.read_text(encoding='utf-8'), duration_ms,
-                                         f'markers/{t.marker_file.name}')
+            tf = parse_tune_file(t.marker_file.read_text(encoding='utf-8'), duration_ms,
+                                 f'markers/{t.marker_file.name}', icons)
+            t.markers_ms = tf.starts
+            t.icon = tf.icon or DEFAULT_ICON
+            t.colour = tf.colour
             continue
         t.proposal_ms = propose_play1_start(loudness_envelope(t.src))
         t.markers_ms = []
@@ -578,7 +647,9 @@ def main(argv=None):
     files = [(f'T{i:02d}.MP3', t) for i, t in enumerate(tunes, 1)]
     index = write_index([IndexTune(t.tune_id, t.title, name, SAMPLE_RATE, CHANNELS, t.stream.total_samples,
                                    len(t.stream.audio), t.stream.delay, MP3_SAMPLES_PER_FRAME, t.markers_ms,
-                                   seconds_table(t.stream)) for name, t in files])
+                                   seconds_table(t.stream), icons[t.icon],
+                                   t.colour if t.colour is not None else default_colour(t.tune_id))
+                      for name, t in files])
     read_index(index)  # self-check
     part = partition_size(PARTITIONS_CSV, PARTITION_NAME)
     capacity = fat_data_bytes(part)
@@ -629,8 +700,9 @@ def main(argv=None):
           f'{SAMPLE_RATE // 1000} kHz)')
     for name, t in files:
         marks = ', '.join(format_time_ms(m) for m in t.markers_ms) or '-'
+        colour = t.colour if t.colour is not None else default_colour(t.tune_id)
         print(f'  {name}  {t.tune_id:08x}  {format_time_ms(t.stream.total_samples * 1000 // SAMPLE_RATE):>7}  '
-              f'starts: {marks:<20} {t.title}')
+              f'starts: {marks:<22} {t.icon:<9} #{colour:06X}  {t.title}')
     print(f'space: {mb(used)} used of {mb(capacity)}, {mb(capacity - used)} left '
           f'(~{minutes_at_bitrate(capacity - used):.0f} min at {BITRATE_KBPS} kbps)')
     if pending:

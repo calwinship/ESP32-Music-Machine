@@ -49,6 +49,81 @@ bool frame_gate_in_preroll(const frame_gate_t *g)
     return g->frame < g->target_frame;
 }
 
+// ---- speeds (plays) ----------------------------------------------------------------------------------------
+static uint32_t marker_sample(const tune_info_t *t, uint8_t i)
+{
+    return seek_ms_to_sample(t->markers_ms[i], t->sample_rate);
+}
+
+uint32_t speed_start(const tune_info_t *t, uint8_t index)
+{
+    if (t->marker_count == 0) {
+        return 0;
+    }
+    if (index >= t->marker_count) {
+        index = (uint8_t)(t->marker_count - 1u);
+    }
+    return marker_sample(t, index);
+}
+
+void speed_at(const tune_info_t *t, uint32_t position, speed_t *out)
+{
+    out->count = t->marker_count ? t->marker_count : 1;
+    out->index = 0;
+    for (uint8_t i = 1; i < t->marker_count; i++) {
+        if (position >= marker_sample(t, i)) {
+            out->index = i;
+        }
+    }
+    out->start = speed_start(t, out->index);
+    out->end = (uint32_t)(out->index + 1u) < t->marker_count ? marker_sample(t, (uint8_t)(out->index + 1u))
+                                                              : t->total_samples;
+}
+
+uint16_t speed_permille(const speed_t *s, uint32_t position)
+{
+    if (position <= s->start || s->end <= s->start) {
+        return 0;
+    }
+    if (position >= s->end) {
+        return 1000;
+    }
+    return (uint16_t)((uint64_t)(position - s->start) * 1000u / (s->end - s->start));
+}
+
+const char *speed_name(uint8_t index, uint8_t count)
+{
+    static const char *const two[] = {"Slow", "Fast"};
+    static const char *const three[] = {"Slow", "Medium", "Fast"};
+    if (count <= 1) {
+        return "";
+    }
+    if (count == 2 && index < 2) {
+        return two[index];
+    }
+    if (count == 3 && index < 3) {
+        return three[index];
+    }
+    return NULL;
+}
+
+bool resume_find(const tune_index_t *ix, uint32_t tune_id, uint32_t position_ms, uint16_t *tune, uint32_t *sample)
+{
+    tune_info_t t;
+    for (uint16_t i = 0; i < ix->count; i++) {
+        if (tune_index_get(ix, i, &t) && t.tune_id == tune_id) {
+            uint32_t s = seek_ms_to_sample(position_ms, t.sample_rate);
+            if (s >= t.total_samples) {
+                s = speed_start(&t, 0);   // saved at the end (or the tune got shorter): its first marker
+            }
+            *tune = i;
+            *sample = s;
+            return true;
+        }
+    }
+    return false;
+}
+
 // ---- MP3 frames ----------------------------------------------------------------------------------------------
 uint32_t mp3_frame_len(const uint8_t *p)
 {
@@ -216,4 +291,26 @@ void text_fold_ascii(char *dst, size_t n, const char *src)
         s += len;
     }
     dst[o] = '\0';
+}
+
+size_t text_utf8(uint32_t cp, char out[5])
+{
+    size_t n = 0;
+    if (cp < 0x80) {
+        out[n++] = (char)cp;
+    } else if (cp < 0x800) {
+        out[n++] = (char)(0xC0 | (cp >> 6));
+        out[n++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000 && (cp < 0xD800 || cp > 0xDFFF)) {
+        out[n++] = (char)(0xE0 | (cp >> 12));
+        out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[n++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp >= 0x10000 && cp <= 0x10FFFF) {
+        out[n++] = (char)(0xF0 | (cp >> 18));
+        out[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[n++] = (char)(0x80 | (cp & 0x3F));
+    }
+    out[n] = '\0';
+    return n;
 }

@@ -29,7 +29,7 @@ static const char *TAG = "player";
 #define CMD_QUEUE_LEN     16
 #define INDEX_PATH        BSP_TUNES_PATH "/INDEX.BIN"
 
-typedef enum { CMD_TAP, CMD_SEEK, CMD_TUNE } cmd_type_t;
+typedef enum { CMD_TAP, CMD_RESTART_SPEED, CMD_SPEED, CMD_SEEK, CMD_SELECT } cmd_type_t;
 typedef struct {
     cmd_type_t type;
     int32_t arg;
@@ -61,6 +61,8 @@ static int16_t s_last_out;      // last sample written (before gain); the fade-o
 static uint32_t s_fade_done = FADE_SAMPLES;
 static unsigned s_decode_errors, s_preroll_errors, s_frames;
 static uint32_t s_rate;         // I2S rate (all tunes must share it)
+static bool s_resume;
+static uint32_t s_resume_id, s_resume_ms;
 
 // ---- commands and status ------------------------------------------------------------------------------------
 static void send(cmd_type_t type, int32_t arg)
@@ -72,8 +74,22 @@ static void send(cmd_type_t type, int32_t arg)
 }
 
 void player_task_tap(void) { send(CMD_TAP, 0); }
+void player_task_restart_speed(void) { send(CMD_RESTART_SPEED, 0); }
+void player_task_change_speed(int32_t delta) { send(CMD_SPEED, delta); }
 void player_task_seek(int32_t clicks) { send(CMD_SEEK, clicks); }
-void player_task_change_tune(int32_t delta) { send(CMD_TUNE, delta); }
+void player_task_select_tune(uint16_t tune) { send(CMD_SELECT, tune); }
+
+static volatile bool s_index_ready;
+
+bool player_tune_title(uint16_t tune, char *buf, size_t n)
+{
+    tune_info_t t;   // tune_index_get only reads the (now constant) index buffer: safe from other tasks
+    if (!s_index_ready || !tune_index_get(&s_ix, tune, &t)) {
+        return false;
+    }
+    strlcpy(buf, t.title, n);
+    return true;
+}
 
 void player_status_get(player_status_t *out)
 {
@@ -84,15 +100,37 @@ void player_status_get(player_status_t *out)
 
 static void status_update(bool title)
 {
+    speed_t sp;
+    speed_at(&s_tune, s_pl.position, &sp);
+    uint16_t permille = speed_permille(&sp, s_pl.position);
+    uint32_t total_ms = s_tune.sample_rate ? (uint32_t)((uint64_t)s_tune.total_samples * 1000u / s_tune.sample_rate)
+                                           : 0;
     taskENTER_CRITICAL(&s_lock);
     if (title) {
-        text_fold_ascii(s_status.title, sizeof(s_status.title), s_tune.title);
+        strlcpy(s_status.title, s_tune.title, sizeof(s_status.title));
     }
+    s_status.tune_id = s_tune.tune_id;
+    s_status.icon = s_tune.icon;
+    s_status.colour = s_tune.colour;
     s_status.elapsed_ms = player_elapsed_ms(&s_pl);
+    s_status.total_ms = total_ms;
     s_status.state = s_pl.state;
     s_status.tune = s_tune_i;
     s_status.tune_count = s_ix.count;
+    s_status.speed = sp.index;
+    s_status.speed_count = sp.count;
+    s_status.speed_permille = permille;
     taskEXIT_CRITICAL(&s_lock);
+}
+
+static const char *speed_label(uint8_t index, uint8_t count, char *buf, size_t n)
+{
+    const char *name = speed_name(index, count);
+    if (name && *name) {
+        return name;
+    }
+    snprintf(buf, n, "%u/%u", (unsigned)index + 1u, (unsigned)count);
+    return buf;
 }
 
 static void status_error(const char *msg)
@@ -227,8 +265,8 @@ static uint32_t first_marker_sample(void)
     return seek_ms_to_sample(s_tune.marker_count ? s_tune.markers_ms[0] : 0, s_tune.sample_rate);
 }
 
-// Open tune i and start it playing from its first marker.
-static bool open_tune(uint16_t i)
+// Open tune i at tune sample `start` (UINT32_MAX = its first marker), playing or paused.
+static bool open_tune_at(uint16_t i, uint32_t start, bool paused)
 {
     char path[48], a[24];
     if (s_reader.f) {
@@ -256,15 +294,19 @@ static bool open_tune(uint16_t i)
     }
     player_start(&s_pl, s_tune.sample_rate, s_tune.total_samples, 0);
     s_decode_errors = s_preroll_errors = s_frames = 0;
-    if (!jump_to(first_marker_sample())) {
+    if (!jump_to(start == UINT32_MAX ? first_marker_sample() : start)) {
         status_update(true);
         return false;
     }
+    if (paused) {
+        player_toggle(&s_pl);
+    }
     char total[16];
     text_mmss(total, sizeof(total), tune_ms(s_tune.total_samples));
-    ESP_LOGI(TAG, "tune %u/%u: %s \"%s\" (id %08x, %s) from %s", (unsigned)i + 1, (unsigned)s_ix.count,
-             s_tune.file_name, s_tune.title, (unsigned)s_tune.tune_id, total,
-             log_time(a, sizeof(a), tune_ms(s_pl.position)));
+    ESP_LOGI(TAG, "tune %u/%u: %s \"%s\" (id %08x, %s, %u speeds) from %s, %s", (unsigned)i + 1,
+             (unsigned)s_ix.count, s_tune.file_name, s_tune.title, (unsigned)s_tune.tune_id, total,
+             (unsigned)(s_tune.marker_count ? s_tune.marker_count : 1), log_time(a, sizeof(a), tune_ms(s_pl.position)),
+             player_state_name(s_pl.state));
     status_update(true);
     return true;
 }
@@ -306,16 +348,42 @@ static void handle(const cmd_t *c)
         }
         break;
     }
-    case CMD_TUNE: {
-        if (!s_ix.count) {
+    case CMD_RESTART_SPEED:
+    case CMD_SPEED: {
+        if (s_pl.state != PLAYER_PLAYING && s_pl.state != PLAYER_PAUSED && s_pl.state != PLAYER_ENDED) {
+            break;
+        }
+        speed_t sp;
+        speed_at(&s_tune, s_pl.position, &sp);
+        int32_t want = c->type == CMD_SPEED ? (int32_t)sp.index + c->arg : sp.index;
+        want = want < 0 ? 0 : want >= sp.count ? sp.count - 1 : want;
+        uint32_t from = s_pl.position;
+        if (s_pl.state == PLAYER_PLAYING) {
+            out_break();
+        }
+        if (!jump_to(speed_start(&s_tune, (uint8_t)want))) {
+            break;
+        }
+        if (c->type == CMD_RESTART_SPEED && s_pl.state != PLAYER_PLAYING) {
+            player_toggle(&s_pl);   // paused (or ended -> paused by the jump) -> playing
+            s_fade_done = 0;
+        }
+        char n1[12], n2[12];
+        ESP_LOGI(TAG, "%s: %s %s -> %s %s (%s)", c->type == CMD_SPEED ? "speed" : "restart speed",
+                 speed_label(sp.index, sp.count, n1, sizeof(n1)), log_time(a, sizeof(a), tune_ms(from)),
+                 speed_label((uint8_t)want, sp.count, n2, sizeof(n2)), log_time(b, sizeof(b), tune_ms(s_pl.position)),
+                 player_state_name(s_pl.state));
+        break;
+    }
+    case CMD_SELECT: {
+        if (c->arg < 0 || c->arg >= s_ix.count) {
             break;
         }
         if (s_pl.state == PLAYER_PLAYING) {
             out_break();
         }
-        int32_t n = s_ix.count;
-        int32_t next = (((int32_t)s_tune_i + c->arg) % n + n) % n;
-        open_tune((uint16_t)next);
+        ESP_LOGI(TAG, "tune chosen from the list: %d", (int)c->arg + 1);
+        open_tune_at((uint16_t)c->arg, UINT32_MAX, false);
         s_fade_done = 0;
         break;
     }
@@ -393,7 +461,19 @@ static void player_task(void *arg)
         vTaskSuspend(NULL);
     }
     player_init(&s_pl);
-    open_tune(0);
+    s_index_ready = true;
+    uint16_t tune;
+    uint32_t sample;
+    if (s_resume && resume_find(&s_ix, s_resume_id, s_resume_ms, &tune, &sample)) {
+        ESP_LOGI(TAG, "resuming tune id %08x at %u ms (paused)", (unsigned)s_resume_id, (unsigned)s_resume_ms);
+        open_tune_at(tune, sample, true);
+    } else {
+        if (s_resume) {
+            ESP_LOGW(TAG, "saved tune id %08x at %u ms is not in the index any more: first tune", (unsigned)s_resume_id,
+                     (unsigned)s_resume_ms);
+        }
+        open_tune_at(0, UINT32_MAX, false);
+    }
 
     for (;;) {
         cmd_t c;
@@ -416,8 +496,11 @@ static void player_task(void *arg)
     }
 }
 
-void player_task_start(void)
+void player_task_start(bool resume, uint32_t resume_tune_id, uint32_t resume_ms)
 {
+    s_resume = resume;
+    s_resume_id = resume_tune_id;
+    s_resume_ms = resume_ms;
     s_cmds = xQueueCreate(CMD_QUEUE_LEN, sizeof(cmd_t));
     xTaskCreatePinnedToCore(player_task, "player", PLAYER_STACK, NULL, PLAYER_PRIO, &s_task, PLAYER_CORE);
 }

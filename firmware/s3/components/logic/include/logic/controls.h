@@ -45,6 +45,38 @@ void volume_mode_enter(volume_mode_t *m, uint32_t now_ms);
 void volume_mode_touch(volume_mode_t *m, uint32_t now_ms);   // a knob click in volume mode: extend it
 bool volume_mode_active(volume_mode_t *m, uint32_t now_ms);  // also ends it once it has timed out
 
+// ---- taps -----------------------------------------------------------------------------------------------------
+#define DOUBLE_TAP_MS 300   // a second tap within this is a double-tap; a single tap is reported after it
+
+typedef enum { TAP_NONE, TAP_SINGLE, TAP_DOUBLE } tap_t;
+typedef struct {
+    bool pending;
+    uint32_t first_ms;
+} tap_detector_t;
+
+// A tap happened: returns TAP_DOUBLE if it completes a double-tap, else TAP_NONE (wait for tap_detector_poll).
+tap_t tap_detector_tap(tap_detector_t *d, uint32_t now_ms);
+// Returns TAP_SINGLE once DOUBLE_TAP_MS have passed after a lone tap.
+tap_t tap_detector_poll(tap_detector_t *d, uint32_t now_ms);
+
+// ---- resume position saving (NVS) ------------------------------------------------------------------------------
+#define RESUME_PLAYING_SAVE_MS 30000   // while playing, save at most this often (flash wear)
+#define RESUME_SETTLE_MS       2000    // when stopped, save once the position has been still this long
+
+typedef struct {
+    bool saved_any;
+    uint32_t tune_id, position_ms;     // what is in NVS
+    uint32_t last_save_ms;
+    uint32_t seen_position_ms, seen_since_ms;
+} resume_saver_t;
+
+// Start from what NVS already holds (so booting doesn't rewrite it). Zeroed struct = nothing saved yet.
+void resume_saver_init(resume_saver_t *r, uint32_t now_ms, uint32_t tune_id, uint32_t position_ms);
+// Called regularly with the player's state. True = write (tune_id, position_ms) now; the saver assumes it was.
+// Saves: on a tune change, every RESUME_PLAYING_SAVE_MS while playing, and once the position is settled while
+// paused/ended (so pausing or seeking while paused is remembered).
+bool resume_should_save(resume_saver_t *r, uint32_t now_ms, uint32_t tune_id, uint32_t position_ms, bool playing);
+
 // ---- click-free transitions ----------------------------------------------------------------------------------
 #define FADE_SAMPLES 160   // 5 ms at 32 kHz
 

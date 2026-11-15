@@ -35,7 +35,7 @@ static int g_checks, g_failures;
         }                                                                        \
     } while (0)
 
-#define FIXTURE "tests/host/fixtures/index_v1.bin"
+#define FIXTURE "tests/host/fixtures/index_v2.bin"
 
 static uint8_t *load(const char *path, size_t *len)
 {
@@ -97,6 +97,8 @@ static void test_fixture_from_python_writer(void)
     CHECK_EQ(t.samples_per_frame, 1152);
     CHECK_EQ(t.seconds_count, 3);
     CHECK_EQ(t.marker_count, 2);
+    CHECK_EQ(t.icon, 0xF06C);          // leaf
+    CHECK_EQ(t.colour, 0x2EC4B6);
     CHECK_EQ(t.markers_ms[0], 500);
     CHECK_EQ(t.markers_ms[1], 2000);
     uint32_t off, frame;
@@ -109,6 +111,7 @@ static void test_fixture_from_python_writer(void)
     CHECK(tune_index_get(&ix, 1, &t));
     CHECK_STR(t.title, "N\xc3\xb3ra Chr\xc3\xadonna");
     CHECK_EQ(t.marker_count, 0);
+    CHECK_EQ(t.icon, 0xF186);          // moon
     CHECK(!tune_index_get(&ix, 2, &t));
     free(buf);
 }
@@ -156,11 +159,13 @@ static void test_consistent_but_wrong_records_are_rejected(void)
         {rec + 24, 4, 2, "seconds_count != ceil(total / rate)"},
         {rec + 26, 3, 1, "3 channels"},
         {rec + 27, 9, 1, "too many markers"},
-        {rec + 32 + 1, '/', 1, "slash in file name"},
-        {rec + 32 + 7 + 9, 3000, 4, "marker past the end"},
-        {rec + 32 + 7 + 9 + 4, 400, 4, "markers not increasing"},
-        {rec + 32 + 7 + 9 + 8 + 8, 900, 4, "second offset past the file"},
-        {rec + 32 + 7 + 9 + 8 + 20, 0, 4, "start frames not monotonic"},
+        {rec + 36 + 1, '/', 1, "slash in file name"},
+        {rec + 36 + 7 + 9, 3000, 4, "marker past the end"},
+        {rec + 36 + 7 + 9 + 4, 400, 4, "markers not increasing"},
+        {rec + 36 + 7 + 9 + 8 + 8, 900, 4, "second offset past the file"},
+        {rec + 36 + 7 + 9 + 8 + 20, 0, 4, "start frames not monotonic"},
+        {rec + 30, 0x0041, 2, "icon not a private-use code point"},
+        {rec + 32, 0x01000000, 4, "colour above 0xFFFFFF"},
         {12, 1, 4, "length field"},
     };
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
@@ -373,6 +378,17 @@ static void test_text(void)
     CHECK_STR(b, "??b");
     text_fold_ascii(b, 4, "Clare Jig");
     CHECK_STR(b, "Cla");
+
+    char u[5];
+    CHECK_EQ(text_utf8(0xF06C, u), 3);
+    CHECK_STR(u, "\xef\x81\xac");      // U+F06C (leaf) as LVGL's LV_SYMBOL_* strings are written
+    CHECK_EQ(text_utf8('A', u), 1);
+    CHECK_STR(u, "A");
+    CHECK_EQ(text_utf8(0xF3, u), 2);
+    CHECK_STR(u, "\xc3\xb3");          // o with fada
+    CHECK_EQ(text_utf8(0x1F600, u), 4);
+    CHECK_EQ(text_utf8(0xD800, u), 0);    // surrogate
+    CHECK_EQ(text_utf8(0x110000, u), 0);
 }
 
 int main(void)

@@ -3,7 +3,7 @@
 #include <string.h>
 
 #define HEADER_LEN 16
-#define RECORD_LEN 32
+#define RECORD_LEN 36
 #define CODEC_MP3  1
 
 static uint32_t rd16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
@@ -55,6 +55,8 @@ static bool parse_record(const uint8_t *data, size_t pos, size_t end, tune_info_
     t->channels = r[26];
     t->marker_count = r[27];
     uint32_t name_len = r[28], title_len = r[29];
+    t->icon = (uint16_t)rd16(r + 30);
+    t->colour = rd32(r + 32);
 
     if (rec_len < RECORD_LEN || rec_len > end - pos) {
         return false;
@@ -66,7 +68,8 @@ static bool parse_record(const uint8_t *data, size_t pos, size_t end, tune_info_
     if (t->tune_id == 0 || t->sample_rate < 8000 || t->sample_rate > 192000 || t->samples_per_frame == 0 ||
         t->channels < 1 || t->channels > 2 || t->total_samples == 0 || t->file_bytes == 0 ||
         t->marker_count > TUNE_INDEX_MAX_MARKERS || name_len < 1 || name_len > TUNE_INDEX_MAX_NAME ||
-        title_len < 1 || title_len > TUNE_INDEX_MAX_TITLE) {
+        title_len < 1 || title_len > TUNE_INDEX_MAX_TITLE || t->icon < 0xE000 || t->icon > 0xF8FF ||
+        t->colour > 0xFFFFFFu) {
         return false;
     }
     if (t->seconds_count != (t->total_samples + (uint64_t)t->sample_rate - 1) / t->sample_rate) {

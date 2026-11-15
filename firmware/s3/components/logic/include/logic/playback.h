@@ -40,6 +40,29 @@ void frame_gate_init(frame_gate_t *g, const seek_plan_t *p);
 uint32_t frame_gate_next(frame_gate_t *g, uint32_t decoded, uint32_t *first);
 bool frame_gate_in_preroll(const frame_gate_t *g);   // true while the next frame is still before the target
 
+// ---- speeds (plays) ----------------------------------------------------------------------------------------
+// Each marker starts one play of the tune ("speed", slowest first). Speed i runs from marker i to marker i+1 (the
+// last to the end of the tune). Before the first marker (lead-in) counts as speed 0 at progress 0. A tune without
+// markers is one speed covering the whole tune.
+typedef struct {
+    uint8_t index;    // 0-based
+    uint8_t count;    // >= 1
+    uint32_t start;   // tune samples
+    uint32_t end;     // exclusive
+} speed_t;
+
+void speed_at(const tune_info_t *t, uint32_t position, speed_t *out);
+uint32_t speed_start(const tune_info_t *t, uint8_t index);   // index clamped to the last speed
+uint16_t speed_permille(const speed_t *s, uint32_t position); // progress through the speed, 0..1000
+// "Slow"/"Fast" for 2 speeds, "Slow"/"Medium"/"Fast" for 3, "" for 1; NULL otherwise (caller shows a number).
+const char *speed_name(uint8_t index, uint8_t count);
+
+// Resume: find the tune with this ID and turn a saved position into a sample. A position at or past the end
+// (saved when the tune ended, or the tune got shorter after a re-sync) gives the tune's first marker. False if the
+// tune is gone, so the caller falls back to the first tune.
+bool resume_find(const tune_index_t *ix, uint32_t tune_id, uint32_t position_ms, uint16_t *tune,
+                 uint32_t *sample);
+
 // ---- MP3 frames ----------------------------------------------------------------------------------------------
 // Length in bytes of the MPEG-1 Layer III frame whose 4-byte header is at p, or 0 if p is not such a header.
 uint32_t mp3_frame_len(const uint8_t *p);
@@ -80,6 +103,8 @@ void text_mmss(char *buf, size_t n, uint32_t ms);
 // UTF-8 -> ASCII for the display font: Latin-1 letters lose their accents (Nóra Chríonna -> Nora Chrionna),
 // anything else non-ASCII becomes '?'. Invalid UTF-8 is handled. Always NUL-terminated.
 void text_fold_ascii(char *dst, size_t n, const char *src);
+// Code point -> UTF-8 in out[0..4] (NUL-terminated). Returns the byte count, 0 for an invalid code point.
+size_t text_utf8(uint32_t cp, char out[5]);
 
 #ifdef __cplusplus
 }

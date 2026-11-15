@@ -17,3 +17,17 @@ slowest first, as `m:ss.s` (or plain seconds). `#` starts a comment.
   run `./sync-tunes --accept "<title>"` (or `--accept-all`), and it never changes a file that already exists:
   edit these by hand, then run `./sync-tunes` again to put the new times on the board.
 - To find a time, play the recording in QuickTime and read the position when the play starts.
+
+## Theme (optional)
+
+Two more lines set how the tune looks on the board:
+
+```
+icon: leaf
+colour: #2EC4B6
+```
+
+- `icon:` is a name from `tools/icons.txt` (54 to choose from). Without it the tune shows a music note.
+- `colour:` is `#RRGGBB`; it tints the icon and the glow behind it. Without it the tune gets a bright colour picked
+  from its title, the same every time.
+- Run `./sync-tunes` after changing either.

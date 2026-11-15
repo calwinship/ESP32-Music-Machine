@@ -96,3 +96,62 @@ void fade_in(int16_t *buf, uint32_t n, uint32_t *done)
         buf[i] = (int16_t)((int32_t)buf[i] * (int32_t)*done / FADE_SAMPLES);
     }
 }
+
+// ---- taps -----------------------------------------------------------------------------------------------------
+tap_t tap_detector_tap(tap_detector_t *d, uint32_t now_ms)
+{
+    if (d->pending && (uint32_t)(now_ms - d->first_ms) < DOUBLE_TAP_MS) {
+        d->pending = false;
+        return TAP_DOUBLE;
+    }
+    d->pending = true;
+    d->first_ms = now_ms;
+    return TAP_NONE;
+}
+
+tap_t tap_detector_poll(tap_detector_t *d, uint32_t now_ms)
+{
+    if (d->pending && (uint32_t)(now_ms - d->first_ms) >= DOUBLE_TAP_MS) {
+        d->pending = false;
+        return TAP_SINGLE;
+    }
+    return TAP_NONE;
+}
+
+// ---- resume position saving ----------------------------------------------------------------------------------
+static bool resume_mark(resume_saver_t *r, uint32_t now_ms, uint32_t tune_id, uint32_t position_ms)
+{
+    r->saved_any = true;
+    r->tune_id = tune_id;
+    r->position_ms = position_ms;
+    r->last_save_ms = now_ms;
+    return true;
+}
+
+void resume_saver_init(resume_saver_t *r, uint32_t now_ms, uint32_t tune_id, uint32_t position_ms)
+{
+    resume_mark(r, now_ms, tune_id, position_ms);
+    r->seen_position_ms = position_ms;
+    r->seen_since_ms = now_ms;
+}
+
+bool resume_should_save(resume_saver_t *r, uint32_t now_ms, uint32_t tune_id, uint32_t position_ms, bool playing)
+{
+    if (position_ms != r->seen_position_ms) {
+        r->seen_position_ms = position_ms;
+        r->seen_since_ms = now_ms;
+    }
+    if (!r->saved_any || tune_id != r->tune_id) {
+        return resume_mark(r, now_ms, tune_id, position_ms);
+    }
+    if (playing) {
+        if ((uint32_t)(now_ms - r->last_save_ms) >= RESUME_PLAYING_SAVE_MS) {
+            return resume_mark(r, now_ms, tune_id, position_ms);
+        }
+        return false;
+    }
+    if (position_ms != r->position_ms && (uint32_t)(now_ms - r->seen_since_ms) >= RESUME_SETTLE_MS) {
+        return resume_mark(r, now_ms, tune_id, position_ms);
+    }
+    return false;
+}

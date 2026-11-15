@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "logic/controls.h"
 #include "logic/playback.h"
@@ -168,8 +169,125 @@ static void test_player_seek(void)
     CHECK(!player_seek(&p, 0));
 }
 
+static tune_info_t three_speeds(void)
+{
+    tune_info_t t = {.sample_rate = SR, .total_samples = 203 * SR, .samples_per_frame = 1152, .marker_count = 3,
+                     .markers_ms = {6800, 101000, 157800}};
+    return t;
+}
+
+static void test_speeds(void)
+{
+    tune_info_t t = three_speeds();
+    speed_t s;
+    speed_at(&t, 0, &s);                                       // lead-in counts as speed 0, progress 0
+    CHECK_EQ(s.index, 0);
+    CHECK_EQ(s.count, 3);
+    CHECK_EQ(s.start, 6800 * 32);
+    CHECK_EQ(s.end, 101000 * 32);
+    CHECK_EQ(speed_permille(&s, 0), 0);
+    speed_at(&t, 101000 * 32 - 1, &s);
+    CHECK_EQ(s.index, 0);
+    CHECK(speed_permille(&s, 101000 * 32 - 1) >= 999);
+    speed_at(&t, 101000 * 32, &s);                             // exactly on a marker: the new speed
+    CHECK_EQ(s.index, 1);
+    CHECK_EQ(speed_permille(&s, 101000 * 32), 0);
+    speed_at(&t, 130000 * 32, &s);
+    CHECK_EQ(s.index, 1);
+    CHECK_EQ(speed_permille(&s, 130000 * 32), (130000 - 101000) * 1000 / (157800 - 101000));
+    speed_at(&t, 203 * SR - 1, &s);                            // last speed runs to the end
+    CHECK_EQ(s.index, 2);
+    CHECK_EQ(s.end, 203 * SR);
+    CHECK_EQ(speed_start(&t, 1), 101000 * 32);
+    CHECK_EQ(speed_start(&t, 9), 157800 * 32);                 // clamps to the last speed
+
+    tune_info_t none = {.sample_rate = SR, .total_samples = 60 * SR, .marker_count = 0};
+    speed_at(&none, 30 * SR, &s);                              // no markers: one speed, the whole tune
+    CHECK_EQ(s.count, 1);
+    CHECK_EQ(s.start, 0);
+    CHECK_EQ(s.end, 60 * SR);
+    CHECK_EQ(speed_permille(&s, 30 * SR), 500);
+    CHECK_EQ(speed_start(&none, 2), 0);
+
+    CHECK(strcmp(speed_name(0, 3), "Slow") == 0);
+    CHECK(strcmp(speed_name(1, 3), "Medium") == 0);
+    CHECK(strcmp(speed_name(2, 3), "Fast") == 0);
+    CHECK(strcmp(speed_name(1, 2), "Fast") == 0);
+    CHECK(strcmp(speed_name(0, 1), "") == 0);
+    CHECK(speed_name(3, 5) == NULL);
+}
+
+static void test_resume_find(void)
+{
+    FILE *f = fopen("tests/host/fixtures/index_v2.bin", "rb");
+    CHECK(f != NULL);
+    if (!f) {
+        return;
+    }
+    uint8_t buf[512];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    tune_index_t ix;
+    CHECK_EQ(tune_index_open(&ix, buf, n), TUNE_INDEX_OK);
+    uint16_t tune = 99;
+    uint32_t sample = 0;
+    CHECK(resume_find(&ix, 0x1a7c2172u, 1500, &tune, &sample));    // Clare Jig, 3 s long in the fixture
+    CHECK_EQ(tune, 0);
+    CHECK_EQ(sample, 48000);
+    tune_info_t t;
+    tune_index_get(&ix, 1, &t);
+    CHECK(resume_find(&ix, t.tune_id, 0, &tune, &sample));
+    CHECK_EQ(tune, 1);
+    CHECK(resume_find(&ix, 0x1a7c2172u, 3000, &tune, &sample));    // saved at the end: back to its first marker
+    CHECK_EQ(tune, 0);
+    CHECK_EQ(sample, 500 * 32);
+    CHECK(!resume_find(&ix, 0xdeadbeefu, 0, &tune, &sample));      // tune removed
+}
+
+static void test_taps(void)
+{
+    tap_detector_t d = {0};
+    CHECK_EQ(tap_detector_poll(&d, 0), TAP_NONE);
+    CHECK_EQ(tap_detector_tap(&d, 1000), TAP_NONE);
+    CHECK_EQ(tap_detector_poll(&d, 1299), TAP_NONE);              // still waiting for a second tap
+    CHECK_EQ(tap_detector_poll(&d, 1300), TAP_SINGLE);
+    CHECK_EQ(tap_detector_poll(&d, 1400), TAP_NONE);              // reported once
+    CHECK_EQ(tap_detector_tap(&d, 2000), TAP_NONE);
+    CHECK_EQ(tap_detector_tap(&d, 2250), TAP_DOUBLE);
+    CHECK_EQ(tap_detector_poll(&d, 3000), TAP_NONE);              // a double is not also a single
+    CHECK_EQ(tap_detector_tap(&d, 4000), TAP_NONE);
+    CHECK_EQ(tap_detector_tap(&d, 4400), TAP_NONE);               // too slow: this starts a new tap
+    CHECK_EQ(tap_detector_poll(&d, 4500), TAP_NONE);
+    CHECK_EQ(tap_detector_poll(&d, 4700), TAP_SINGLE);
+}
+
+static void test_resume_saving(void)
+{
+    resume_saver_t r = {0};
+    CHECK(resume_should_save(&r, 0, 7, 1000, true));              // nothing saved yet
+    CHECK(!resume_should_save(&r, 1000, 7, 2000, true));
+    CHECK(!resume_should_save(&r, 29999, 7, 31000, true));
+    CHECK(resume_should_save(&r, 30000, 7, 31000, true));         // every 30 s while playing
+    CHECK_EQ(r.position_ms, 31000);
+    CHECK(resume_should_save(&r, 31000, 8, 6800, true));          // tune change: at once
+    CHECK(!resume_should_save(&r, 32000, 8, 8000, false));        // paused: wait until it settles
+    CHECK(!resume_should_save(&r, 33999, 8, 8000, false));
+    CHECK(resume_should_save(&r, 34000, 8, 8000, false));
+    CHECK(!resume_should_save(&r, 40000, 8, 8000, false));        // nothing new
+    CHECK(!resume_should_save(&r, 41000, 8, 4000, false));        // seek while paused
+    CHECK(resume_should_save(&r, 43000, 8, 4000, false));
+
+    resume_saver_init(&r, 50000, 9, 12000);                       // from NVS at boot: no rewrite
+    CHECK(!resume_should_save(&r, 50000, 9, 12000, false));
+    CHECK(!resume_should_save(&r, 60000, 9, 12000, false));
+}
+
 int main(void)
 {
+    test_speeds();
+    test_resume_find();
+    test_taps();
+    test_resume_saving();
     test_quick_clicks_combine_into_one_jump();
     test_click_timer_survives_wrap();
     test_seek_target();
