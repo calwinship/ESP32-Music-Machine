@@ -1,0 +1,3 @@
+# Start time of each play of "Kerry Polka" (m:ss.s), one per line, slow to fast.
+# Proposed by sync-tunes on 2026-11-15 (play 1 only); add the later plays by hand.
+0:02.2
