@@ -149,6 +149,8 @@ This is a reason never to erase the ESP32 without a plan. If S3 audio is ever si
   debounce means `KNOB_RIGHT`, and on B means `KNOB_LEFT`. It polls every 3 ms with a 2-tick debounce and internal pull-ups
   (`DEMO/04_Encoder_Test/components/user_encoder_bsp/src/bidi_switch_knob.c:20-21,63-102,270-279`).
 - **SD:** 4-bit SDMMC at `SDMMC_FREQ_HIGHSPEED`, FAT mounted at `/sdcard`, no card-detect pin (`sdcard_bsp.c:39-58`; SCH p4).
+- **DAC sample rates without MCLK:** the PCM5100A PLL locks to BCK only at 16 (64fs only), 32, 44.1, 48 kHz and higher
+  (`Pcm5100a.pdf` Table 11); there is no 22.05/24 kHz row. Verified by ear on this board: 32, 44.1 and 48 kHz (verification log).
 - **DAC config pins (SCH p5):** FMT=GND, FLT=GND, DEMP=AGND, SCK=GND, so there is no MCLK. Output `OUTL`/`OUTR` → CN1 → 3.5 mm jack
   (WIKI lists a jack; its circuit is not in the schematic).
 - **Audio demo:** I2S1 STD TX at 44.1 kHz/16-bit, PDM RX on I2S0 at 44.1 kHz mono (`audio_bsp.c:22-27,55,84`).
@@ -208,6 +210,8 @@ The WIKI ESP-IDF section names no IDF version. Its Arduino section requires ardu
 | 2026-11-14 | v5.5.6 07 loopback: knob clicks audible, louder clockwise; log `vol:` 10→19→12→19→14 | user: "yes to all" + 120 s log |
 | 2026-11-14 | **firmware/s3 (own app, IDF v5.5.6)**: boots; display + touch init OK; knob decoded through `logic/knob` (log `value=51..53 (knob cw)`, `..49 (knob ccw)`) | `./flash` boot log |
 | 2026-11-14 | firmware/s3 UI: arc + number shown; clockwise up / anticlockwise down; tap resets to 50; clean rendering | user: "yes to all" |
+| 2026-11-15 | **DAC at 48 kHz, no MCLK** (PLL from BCK, `Pcm5100a.pdf` Table 11). `docs/vendor/work/07_Audio_Rate48`: copy of the 07 playback variant, only change `I2S_SAMPLE_RATE` 44100→48000 + clip (Sporting Paddy 0:10–0:40) resampled to 48 kHz s16 stereo; vendor left-justified format and volume 10 kept; IDF v5.5.6. Clean boot, `main: audio start` | user: normal speed and pitch, no crackle/dropouts |
+| 2026-11-15 | **DAC at 32 kHz, no MCLK**: same test, `07_Audio_Rate32` (32000, clip resampled to 32 kHz) | user: normal speed and pitch, no crackle/dropouts |
 
 ## Known quirks in the vendor demo code (for later)
 
