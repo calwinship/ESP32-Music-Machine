@@ -1,3 +1,5 @@
 # Start time of each play of "The Wise Maid" (m:ss.s), one per line, slow to fast.
 # Proposed by sync-tunes on 2026-11-15 (play 1 only); add the later plays by hand.
 0:05.5
+2:45.0
+4:31.0
