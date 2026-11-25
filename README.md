@@ -115,8 +115,30 @@ The board's other chip (an ESP32 running Waveshare's factory firmware) is left a
 tools/gen_fonts.sh           # rebuild the fonts (only when adding icons or characters)
 ```
 
-The USB-C plug works both ways round, but each way reaches a different chip. `./flash` only ever flashes the ESP32-S3;
-if it says no S3 port was found, flip the plug.
+Run these in Terminal from this folder (or in Claude Code, prefixed with `!`).
+
+### Which chip am I plugged into?
+
+The board has two chips, and the USB-C socket has a separate connection to each. Which one your Mac sees depends on
+which way round the plug goes in:
+
+- **ESP32-S3**: runs this music player. This is the one you want.
+- **ESP32-U4WDH**: runs Waveshare's factory software. Leave it alone.
+
+To check, run:
+
+```sh
+ls /dev/cu.usb*
+```
+
+| You see | Meaning | Do |
+|---|---|---|
+| `/dev/cu.usbmodem…` | ESP32-S3 | Nothing, you're ready |
+| `/dev/cu.usbserial…` | ESP32-U4WDH | Unplug, turn the plug over, plug back in |
+| `no matches found` | Nothing connected | Push the plug in firmly; if still nothing, try another cable (some only charge) |
+
+You don't have to check first: `./flash`, `./logs` and `./sync-tunes` only ever talk to the ESP32-S3, and if they say
+no S3 port was found, flip the plug.
 
 First-time setup on a Mac:
 
