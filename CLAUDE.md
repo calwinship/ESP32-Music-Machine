@@ -8,10 +8,12 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 - `./flash [secs]`: build + flash the **S3 only** + print boot logs (default 8 s)
 - `./logs [secs] [--reset none]`: capture logs without a TTY (resets the board unless `--reset none`)
 - `./test`: host unit tests: `components/logic` (cc + ASan/UBSan) and `tools/sync_tunes.py` (Python), no board needed
-- `./sync-tunes [--wipe-card] [--built-in] [--no-flash] [--accept "<title>"] [--accept-all]`: `recordings/*.m4a` → MP3 +
+- `./sync-tunes [--wipe-card] [--built-in] [--no-flash]`: `recordings/*.m4a` → MP3 +
   `INDEX.BIN` → FAT image → **SD card** (default, 96 kbps, own FAT16 builder, written through the running firmware over
   USB: `tools/board_link.py`, ~0.3 MB/s) or, with `--built-in`, **only** the S3 `tunes` flash partition (32 kbps,
   fatfsgen + parttool, ~2–3 min). A card without tunes is only erased with `--wipe-card`. Cache/images in `build-tunes/`
+- `./mark "<title>" [--all]`: interactive (afplay): check / re-tap each play start by ear; rewrites the markers file
+  (keeps icon/colour) only after the user confirms. Needs a person at the keyboard: don't run it yourself (it plays audio)
 - `. tools/idf_env.sh`: ESP-IDF shell for manual `idf.py` use
 - `tools/gen_fonts.sh`: regenerate `firmware/s3/main/fonts/` (Latin-1 text with fadas, 64 px digits, tune icons from
   `tools/icons.txt`) with `npx lv_font_conv@1.5.2`; output is committed, so only needed when glyphs change
@@ -36,8 +38,10 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 - `tests/host/`: tests for `logic` (incl. vendor knob equivalence; INDEX.BIN golden fixture shared with Python) and `sync_tunes.py`
 - `tools/monitor.py`: serial capture; survives USB re-enumeration; `--print-port` gives the S3 port only
 - `recordings/`: the user's `.m4a` memos (gitignored; file name = title). `recordings/not-synced/` is ignored by sync
-- `markers/<title>.txt` (git-tracked): start time of each play. sync-tunes only creates missing files, after the user
-  confirms (`--accept`); **never overwrite or edit one without asking.** Format: `markers/README.md`
+- `markers/<title>.txt` (git-tracked): start time of each play. For a recording without one, sync-tunes guesses every
+  play start (play 1 by loudness, later plays by tempo: `propose_play_starts`, measured on the 16 hand-set files) and
+  writes it automatically (user's request, 2026-11-26). Existing files: changed only by the user (`./mark` or by hand);
+  **never overwrite or edit one without asking.** Format: `markers/README.md`
 - `markers/` files may also set `icon:` (name from `tools/icons.txt`) and `colour: #RRGGBB`; both go into INDEX.BIN v2
 - Tunes: MP3 CBR mono 32 kHz (listening test 2026-11-15); 96 kbps on the SD card (blind test 2026-11-25), 32 kbps in
   flash (what fits); tune ID = FNV-1a of the normalised title

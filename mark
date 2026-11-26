@@ -1,0 +1,5 @@
+#!/bin/zsh
+# Check or set where each play of a tune starts, by ear (no file editing). Usage: ./mark "<title>" [--all]
+# Writes markers/<title>.txt after asking; run ./sync-tunes afterwards. Details: ./mark --help
+set -euo pipefail
+exec python3 "${0:A:h}/tools/mark.py" "$@"

@@ -13,10 +13,12 @@ slowest first, as `m:ss.s` (or plain seconds). `#` starts a comment.
 
 - Times must increase and fall inside the recording; `./sync-tunes` stops with the file and line number otherwise.
 - At most 8 start times. A tune with no file plays from 0:00.
-- When a file is missing, `./sync-tunes` proposes the start of play 1 and prints it. It writes the file only when you
-  run `./sync-tunes --accept "<title>"` (or `--accept-all`), and it never changes a file that already exists:
-  edit these by hand, then run `./sync-tunes` again to put the new times on the board.
-- To find a time, play the recording in QuickTime and read the position when the play starts.
+- You don't have to make these files. When a recording has none, `./sync-tunes` guesses where each play starts
+  (play 1 from the first sustained sound, later plays from the change in tempo) and writes the file. It never changes
+  a file that already exists.
+- To check or fix the times by ear: `./mark "<title>"` (or `./mark "<title>" --all` to tap them all from the
+  beginning). It asks before saving and keeps the icon and colour lines. Then run `./sync-tunes`.
+- You can still edit a file by hand (play the recording in QuickTime and read the position); run `./sync-tunes` after.
 
 ## Theme (optional)
 

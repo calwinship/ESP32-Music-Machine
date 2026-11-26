@@ -12,6 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent / 'tools'))
 import sync_tunes as st  # noqa: E402
 import board_link as bl  # noqa: E402
+import mark  # noqa: E402
 
 FIXTURE = HERE / 'fixtures' / 'index_v2.bin'
 
@@ -81,8 +82,16 @@ class Markers(unittest.TestCase):
             st.parse_markers(''.join(f'{i}\n' for i in range(1, 10)), 200000, 'f')
 
     def test_proposal_file_round_trips(self):
-        text = st.marker_file_text('Clare Jig', [6800], '2026-11-15')
-        self.assertEqual(st.parse_markers(text, 200000, 'f'), [6800])
+        text = st.marker_file_text('Clare Jig', [6800, 101000, 157800], '2026-11-15')
+        self.assertEqual(st.parse_markers(text, 200000, 'f'), [6800, 101000, 157800])
+        self.assertIn('./mark "Clare Jig"', text)
+
+    def test_mark_keeps_icon_and_colour(self):
+        text = st.marker_file_text('Clare Jig', [6800, 99000], '2026-11-26', how='set with ./mark', icon='leaf',
+                                   colour=0x2EC4B6)
+        tf = st.parse_tune_file(text, 200000, 'f', st.load_icons())
+        self.assertEqual((tf.starts, tf.icon, tf.colour), ([6800, 99000], 'leaf', 0x2EC4B6))
+        self.assertIn('Set with ./mark on 2026-11-26', text)
 
     def test_never_overwrites(self):
         with tempfile.TemporaryDirectory() as d:
@@ -333,6 +342,61 @@ class Fat16Image(unittest.TestCase):
             for name, content in self.FILES:
                 # fatfsparse names its output folder after the volume label
                 self.assertEqual((Path(d) / 'TUNES' / name).read_bytes(), content, name)
+
+
+class PlayStarts(unittest.TestCase):
+    """Later plays found by tempo (propose_play_starts) on synthetic onset trains: no ffmpeg needed."""
+    HOP = st.ONSET_HOP_S
+
+    def train(self, parts, lead_s=3.0):
+        """Onset strength: silence for lead_s, then (seconds, beat period) parts of clicks with an off-beat accent."""
+        o = [0.0] * int(lead_s / self.HOP)
+        for secs, period in parts:
+            n = int(secs / self.HOP)
+            seg = [0.0] * n
+            t = 0.0
+            while t < secs:
+                i = int(t / self.HOP)
+                if i < n:
+                    seg[i] = 1.0
+                j = int((t + period * 0.66) / self.HOP)
+                if j < n:
+                    seg[j] = 0.5
+                t += period
+            o += seg
+        return o
+
+    def test_three_plays_each_faster(self):
+        o = self.train([(60, 0.60), (40, 0.42), (30, 0.30)])
+        starts = st.propose_play_starts(o, 3000)
+        self.assertEqual(len(starts), 3)
+        self.assertEqual(starts[0], 3000)
+        for got, change in zip(starts[1:], (63.0, 103.0)):
+            self.assertLess(abs(got / 1000 - (change - st.PLAY_LEAD_S)), 2.5, starts)
+
+    def test_two_plays(self):
+        starts = st.propose_play_starts(self.train([(40, 0.55), (30, 0.38)]), 3000)
+        self.assertEqual(len(starts), 2, starts)
+        self.assertLess(abs(starts[1] / 1000 - (43.0 - st.PLAY_LEAD_S)), 2.5, starts)
+
+    def test_one_steady_tempo_is_one_play(self):
+        self.assertEqual(st.propose_play_starts(self.train([(70, 0.5)]), 3000), [3000])
+
+    def test_too_short_for_a_second_play(self):
+        self.assertEqual(st.propose_play_starts(self.train([(20, 0.5)]), 3000), [3000])
+
+
+class Mark(unittest.TestCase):
+    def test_tap_time_takes_off_the_delay_and_rounds(self):
+        self.assertEqual(mark.tap_to_ms(80000, 15.0, delay_s=0.3), 94700)
+        self.assertEqual(mark.tap_to_ms(0, 0.1, delay_s=0.35), 0)
+
+    def test_fits_between_neighbours(self):
+        self.assertTrue(mark.fits(90000, 8000, 140000, 200000))
+        self.assertFalse(mark.fits(10000, 8000, 140000, 200000))     # too close to play 1
+        self.assertFalse(mark.fits(137000, 8000, 140000, 200000))    # too close to the next
+        self.assertFalse(mark.fits(200000, 8000, None, 200000))      # past the end
+        self.assertTrue(mark.fits(5000, None, None, 200000))
 
 
 class BoardLink(unittest.TestCase):

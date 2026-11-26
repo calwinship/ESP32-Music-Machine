@@ -5,8 +5,8 @@ A pocket **practice player for Irish trad tunes**, running on the Waveshare **ES
 
 Each tune is a voice-memo recording of the tune played two or three times, slow to fast. The player knows where each
 play (each **speed**) starts, so you can jump straight to the speed you're practising, nudge back a couple of seconds
-with the knob, and loop a section again and again. All tunes live in the board's own flash, so no SD card or phone
-is needed.
+with the knob, and loop a section again and again. The tunes live on the board's micro-SD card (about 11 hours fit),
+with a smaller copy in its own flash as a fallback, so no phone is needed.
 
 ```
           ▭                   battery (only when not on USB)
@@ -44,25 +44,73 @@ The board's other chip (an ESP32 running Waveshare's factory firmware) is left a
 
 ## Adding or changing tunes
 
-1. Put the recording in `recordings/` as `<Tune title>.m4a` (any voice memo works). The file name becomes the title.
-2. Run `./sync-tunes --no-flash`. For a new tune it **proposes** when play 1 starts and prints it, but writes nothing.
-3. Accept that with `./sync-tunes --accept "<Tune title>"`. That writes `markers/<Tune title>.txt`. Then, by hand, add
-   the start times of plays 2 and 3 (find them in QuickTime):
-   ```
-   # Clare Jig
-   0:06.8
-   1:41.0
-   2:37.8
-   icon: leaf
-   colour: #2EC4B6
-   ```
-   `icon:` is a name from `tools/icons.txt` (54 to choose from) and `colour:` is any `#RRGGBB`; both are optional.
-   Full format: [`markers/README.md`](markers/README.md).
-4. Run `./sync-tunes` with the board plugged in. It converts every recording, builds the tune image, and writes
-   **only** the tunes area of the flash. That takes about 2–3 minutes, and your volume and resume point are kept.
+You need the board plugged into the Mac, the right way up, and a Terminal open in this folder (or Claude Code: put
+`!` in front of each command).
 
-`sync-tunes` never overwrites a markers file, and it refuses, with the numbers, if the tunes don't fit. The current
-16 tunes are 56 minutes, which fills the 13.5 MB tunes area; an SD card or online sync is the planned way to grow.
+### Add new tunes
+
+1. **Copy the recording in.** Put the Voice Memo in `recordings/` and name it after the tune, for example
+   `recordings/Cup of Tea.m4a`. The file name (without `.m4a`) is the title shown on the board, fadas included. Add as
+   many as you like at once. Recordings you're not ready for can wait in `recordings/not-synced/`, which is ignored.
+
+2. **Check the plug.** Run `ls /dev/cu.usb*`. You want `/dev/cu.usbmodem…`; if you see `/dev/cu.usbserial…`, turn the
+   USB-C plug over (see [Which chip am I plugged into?](#which-chip-am-i-plugged-into)).
+
+3. **Sync.** Run:
+   ```sh
+   ./sync-tunes
+   ```
+   For each new recording it works out where every play starts and writes `markers/<title>.txt` for you (you never
+   have to create that file). Then it converts every recording and writes them all to the SD card. The board shows
+   "Syncing tunes" with a percentage; keep the cable in. It takes about 2½ minutes for 16 tunes, longer with more.
+   At the end you should see:
+   ```
+   sync-tunes: written and read back in 137 s; the board now plays 17 tunes from the SD card
+   ```
+   followed by a list of the new tunes and the start times it guessed.
+
+4. **Check the speeds on the board.** Open the tune list, pick the new tune, then tap each segment of the ring
+   (teal = slow, amber = medium, coral = fast). Each tap should start that play from its beginning. The guess is
+   right to within about 2 seconds most of the time, but not always, and occasionally it gets the number of plays
+   wrong. Starting a second early is fine; starting late cuts off the first notes.
+
+5. **Fix a start that's wrong** (only if step 4 found one):
+   ```sh
+   ./mark "Cup of Tea"
+   ```
+   For each play it plays the few seconds around the marked start and asks: press **Enter** if it's right, **t** to
+   tap it again (the recording plays, and you press Enter the moment the play starts), **d** to delete a play that
+   isn't there, **r** to replay. If the guess is badly off, `./mark "Cup of Tea" --all` plays the whole recording
+   and you press Enter as each play starts (play 1 too), then **q**. It asks before saving. Then run `./sync-tunes`
+   again to put the new times on the board.
+
+6. **Save your work** (optional, recommended). The `markers/` files are the only thing you can't recreate from the
+   recordings, so commit them to git: `git add markers && git commit -m "Markers for Cup of Tea"` (or ask Claude).
+
+### Change or remove a tune
+
+- **Rename:** rename the `.m4a` and its `markers/` file to the same new name, then `./sync-tunes`.
+- **Remove:** move the `.m4a` into `recordings/not-synced/`, then `./sync-tunes`. Its markers file stays (it's
+  ignored), so the times come back if you return the recording.
+- **Icon and colour:** add `icon: leaf` (a name from `tools/icons.txt`, 54 to choose from) and/or `colour: #2EC4B6`
+  lines to the tune's markers file, then `./sync-tunes`. Without them the tune gets a music note and a colour picked
+  from its title. Format details: [`markers/README.md`](markers/README.md).
+
+### If something goes wrong
+
+| Message | What to do |
+|---|---|
+| `no ESP32-S3 port` | Plug in, or turn the USB-C plug over (step 2) |
+| `the SD card does not hold tunes yet` | A new card, or the last sync was interrupted. `./sync-tunes --wipe-card` (erases the card) |
+| `the board found no SD card` | Check the card is in. Meanwhile `./sync-tunes --built-in` fills the built-in storage |
+| Cable pulled out during a sync | Nothing is lost: within a minute the board goes back to playing its built-in tunes. Run `./sync-tunes --wipe-card` |
+| `markers/….txt:3: …` | That line of the markers file isn't a valid time; fix it with `./mark "<title>"` or by hand |
+
+### Built-in storage (fallback)
+
+The board also has 13.5 MB of its own flash for tunes, used when there's no SD card (or it isn't a tunes card). It
+only changes when you run `./sync-tunes --built-in`, which writes 32 kbps copies and refuses if they don't fit
+(about 16 tunes, 56 minutes).
 
 ---
 
@@ -71,19 +119,28 @@ The board's other chip (an ESP32 running Waveshare's factory firmware) is left a
 ```
  your Mac                                             the board
  ─────────                                            ─────────
- recordings/*.m4a ─┐                                  flash (16 MB)
- markers/*.txt ────┤ ./sync-tunes                     ├ app (3 MB): this firmware
-                   ├─ ffmpeg → MP3 32 kbps mono 32 kHz├ nvs: volume, resume point, "guide seen"
-                   ├─ INDEX.BIN (titles, speeds,      └ tunes (13 MB, read-only FAT) ── /tunes/T01.MP3 … INDEX.BIN
+ recordings/*.m4a ─┐                                  micro-SD card (FAT16) ─┐ /tunes/T01.MP3 … INDEX.BIN
+ markers/*.txt ────┤ ./sync-tunes                     flash (16 MB)          │ (the card if it has tunes,
+                   ├─ guesses play starts (new tunes) ├ app (3 MB): firmware │  else the flash "tunes" area)
+                   ├─ ffmpeg → MP3 96 kbps mono 32 kHz├ nvs: volume, resume  │
+                   ├─ INDEX.BIN (titles, speeds,      └ tunes (13 MB): 32 kbps fallback (--built-in)
                    │  seek table, icon, colour)                 │
-                   └─ FAT image → writes only "tunes"           ▼
+                   └─ FAT image → over USB to the card          ▼
                                                       player task: read 144-byte MP3 frames → decoder (esp_audio_codec)
                                                         → volume → I2S (32 kHz) → PCM5100A DAC → headphone jack
                                                       UI task (LVGL): screen, touch, knob → commands to the player
 ```
 
-- **Format.** MP3 at 32 kbps, mono, 32 kHz: you chose it by listening. 32 kHz is one of the few rates the DAC can lock
-  to without a master clock; this was tested on the board. Each MP3 frame is a fixed 144 bytes, which makes seeking easy.
+- **Format.** MP3, mono, 32 kHz, chosen by listening: 96 kbps on the SD card (a blind test ranked 96 > 64 > 48 > 32),
+  32 kbps in the built-in flash, where space is tight. 32 kHz is one of the few rates the DAC can lock to without a
+  master clock; this was tested on the board. Every MP3 frame of a tune is the same size, which makes seeking easy.
+- **Writing the card.** `./sync-tunes` asks the running player to restart into sync mode, then sends the card image
+  in checksummed 32 KB pieces; the board writes each one, reads it back and compares. The card's first sector is
+  cleared first and written last, so a half-finished sync never looks like a valid card.
+- **Finding the plays.** Play 1 starts at the first sustained sound. Later plays have no pause before them, so they're
+  found by tempo: a rhythm fingerprint every half second, split where it changes, kept only where the next stretch is
+  at least 15% faster. On the first 16 recordings it counted the plays right for 15 and put 20 of 28 starts within 2 s
+  of the hand-set times; hence step 4.
 - **Exact seeking.** `INDEX.BIN` stores, for every second of every tune, where decoding has to start. MP3 frames lean
   on earlier frames (the "bit reservoir"), so that point is a little before the second itself. The player decodes from
   there and throws away the extra, so a jump lands on the exact sample. This was checked against a full decode on the
@@ -111,7 +168,8 @@ The board's other chip (an ESP32 running Waveshare's factory firmware) is left a
 ./flash                      # compile + flash the ESP32-S3 + show 8 s of boot logs
 ./logs 60                    # reset the board and print 60 s of logs   (--reset none = don't reset)
 ./test                       # unit tests on the Mac (C logic with sanitizers + sync-tunes in Python); no board
-./sync-tunes                 # recordings + markers -> the board's tunes area   (--no-flash, --accept "<title>", --accept-all)
+./sync-tunes                 # recordings + markers -> the SD card   (--wipe-card, --built-in, --no-flash = don't touch the board)
+./mark "<title>"             # check or re-tap where each play starts, by ear   (--all: tap them all from the beginning)
 tools/gen_fonts.sh           # rebuild the fonts (only when adding icons or characters)
 ```
 
@@ -155,7 +213,7 @@ python3 tools/idf_tools.py install cmake        # ESP-IDF's tested CMake (3.30.2
 ## Code map
 
 ```
-build flash logs test sync-tunes   one-word commands
+build flash logs test sync-tunes mark   one-word commands
 markers/                           start times + icon/colour per tune (yours, tracked in git)
 recordings/                        your .m4a memos (not in git)
 firmware/s3/                       the ESP-IDF project
@@ -164,7 +222,7 @@ firmware/s3/                       the ESP-IDF project
   components/logic/                pure C rules, no ESP-IDF: unit-tested on the Mac
   partitions.csv                   flash layout (app 3 MB, tunes 13 MB)
 tests/host/                        unit tests (C and Python), incl. an INDEX.BIN fixture shared by both
-tools/                             sync_tunes.py, gen_fonts.sh, icons.txt, monitor.py (log capture)
+tools/                             sync_tunes.py, mark.py, board_link.py, gen_fonts.sh, icons.txt, monitor.py
 docs/hardware.md                   every pin, which chip owns what, and the hardware verification log
 ```
 
@@ -220,7 +278,9 @@ Drivers stay thin, and `main/` wires the two together.
 
 | | |
 |---|---|
-| `sync_tunes.py` | Recordings → MP3 → `INDEX.BIN` → FAT image → the board; proposes play-1 start times; never overwrites markers |
+| `sync_tunes.py` | Recordings → MP3 → `INDEX.BIN` → FAT image → SD card (or flash); guesses play starts for new tunes; never overwrites markers |
+| `mark.py` | Plays the audio around each play start; keep, re-tap or delete; saves the markers file after asking |
+| `board_link.py` | The Mac side of the USB link: framed, checksummed messages to the firmware; writes the card image |
 | `gen_fonts.sh` | Builds the fonts: text with fadas, large digits, and the tune icons listed in `icons.txt` |
 | `monitor.py` | Captures logs and survives the USB port vanishing when the board resets |
 
@@ -236,7 +296,10 @@ Everything above has been checked on the board, with logs and by ear and eye; th
 - Whether Waveshare's own audio demo used the wrong I2S format is UNVERIFIED. This player uses the format the DAC is
   wired for, and plays correctly.
 - The DAC's mute pin is driven by the *other* chip's factory firmware. If audio is ever silent, suspect that first.
-- Detecting the start of plays 2 and 3 automatically was set aside; they're typed in by hand.
+- Play starts after play 1 are guessed by tempo and can be a few seconds off (check them on the board, fix with
+  `./mark`).
+- The card is written as one FAT16 volume, so cards up to 2 GB are used in full; a bigger card would need FAT32.
+- Writing the card runs at about 0.3 MB/s (2½ minutes for 16 tunes; ~25 minutes if the card were nearly full).
 
 The original board-bring-up tour of this repo (the `baseline` tag) is still there: `git show baseline:README.md`.
 

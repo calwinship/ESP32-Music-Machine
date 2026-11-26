@@ -6,9 +6,9 @@ Run through ./sync-tunes (IDF Python env). Steps:
   1. recordings/*.m4a -> title (file name, trimmed, NFC) and a stable tune ID (FNV-1a of the normalised title).
   2. ffmpeg -> MP3 CBR mono (cached in build-tunes/cache). Our own parser walks the frames, drops the Info/LAME frame
      and records, for every second, where decoding must start so that seeking to any sample in it is exact.
-  3. markers/<title>.txt (git-tracked) gives the start time of each play. Missing file -> propose play 1's start and
-     print it; a file is written only with --accept / --accept-all (or a y/n prompt in a terminal), never over an
-     existing file.
+  3. markers/<title>.txt (git-tracked) gives the start time of each play. Missing file -> sync-tunes guesses every
+     play's start (play 1 by loudness, later plays by tempo) and writes the file; it never changes an existing file.
+     ./mark "<title>" (tools/mark.py) checks or re-taps the starts by ear.
   4. Size check: SD card -> a FAT16 volume just big enough for the files (checked against the card the board reports);
      --built-in -> the `tunes` partition in firmware/s3/partitions.csv. Refuse if it doesn't fit.
   5. IDF fatfsgen.py -> raw FAT image.
@@ -199,10 +199,14 @@ def parse_markers(text, duration_ms, where):
     return parse_tune_file(text, duration_ms, where).starts
 
 
-def marker_file_text(title, starts_ms, today):
+def marker_file_text(title, starts_ms, today, how='guessed by sync-tunes', icon=None, colour=None):
     lines = [f'# Start time of each play of "{title}" (m:ss.s), one per line, slow to fast.',
-             f'# Proposed by sync-tunes on {today} (play 1 only); add the later plays by hand.']
+             f'# {how[0].upper() + how[1:]} on {today}. Check each speed on the board; fix with ./mark "{title}".']
     lines += [format_time_ms(ms) for ms in starts_ms]
+    if icon:
+        lines.append(f'icon: {icon}')
+    if colour is not None:
+        lines.append(f'colour: #{colour:06X}')
     return '\n'.join(lines) + '\n'
 
 
@@ -265,6 +269,140 @@ def propose_play1_start(env, step_s=ENV_STEP_S, sustain_s=2.0, active_frac=0.9, 
             ms = max(0.0, i * step_s - lead_s) * 1000
             return int(round(ms / 100)) * 100
     return None
+
+
+# ---------------------------------------------------------------- later plays (tempo changes)
+# The plays follow each other without a pause, so they are found by tempo, not loudness: each play is the same tune,
+# faster. Measured on the 16 hand-checked marker files (2026-11-26): every real play change was >= 1.26x faster, and
+# the changes found are a median 2 s after the hand-set starts (the pick-up into the next play). With that shift: play
+# count right for 15 of 16 tunes; 20 of 28 later starts within 2 s, 22 within 3 s, worst 11.4 s. So it is a proposal:
+# check each speed on the board and fix a start with ./mark.
+
+ONSET_HOP_S = 256 / 16000      # ffmpeg aspectralstats hop at 16 kHz, window 512
+PLAY_WIN_S = 6.0               # rhythm fingerprint window ...
+PLAY_STEP_S = 0.5              # ... and step
+PLAY_MIN_S = 15.0              # a play is at least this long
+PLAY_LEAD_S = 2.0              # move each detected change this much earlier
+PLAY_MIN_SPEEDUP = 1.15        # neighbours closer in tempo than this are one play
+MAX_PROPOSED_PLAYS = 3
+
+
+def onset_strength(path):
+    """Note-onset strength every ONSET_HOP_S: ffmpeg's spectral flux minus its 1 s running mean, negatives dropped."""
+    af = ('aformat=channel_layouts=mono,aresample=16000,aspectralstats=win_size=512:measure=flux,'
+          'ametadata=print:key=lavfi.aspectralstats.1.flux:file=-')
+    out = run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(path), '-af', af, '-f', 'null', '-'])
+    flux = [float(v) if v not in ('nan', 'inf', '-inf') else 0.0 for v in re.findall(r'flux=(\S+)', out)]
+    return novelty(flux)
+
+
+def novelty(flux, avg_s=0.5):
+    w = max(1, int(avg_s / ONSET_HOP_S))
+    pre = [0.0]
+    for x in flux:
+        pre.append(pre[-1] + x)
+    out = []
+    for i, x in enumerate(flux):
+        a, b = max(0, i - w), min(len(flux), i + w + 1)
+        out.append(max(0.0, x - (pre[b] - pre[a]) / (b - a)))
+    return out
+
+
+def _autocorr(seg, l0, l1, stride=1):
+    mu = sum(seg) / len(seg)
+    seg = [x - mu for x in seg]
+    e = sum(x * x for x in seg) or 1.0
+    n = len(seg)
+    return [sum(seg[i] * seg[i + lag] for i in range(n - lag)) / e for lag in range(l0, min(l1, n - 1), stride)]
+
+
+def rhythm_signatures(o, start_s=0.0, win_s=PLAY_WIN_S, step_s=PLAY_STEP_S, lag_min=0.15, lag_max=1.6):
+    """One autocorrelation curve (beat lengths lag_min..lag_max) per window, from start_s on."""
+    W, l0, l1 = int(win_s / ONSET_HOP_S), int(lag_min / ONSET_HOP_S), int(lag_max / ONSET_HOP_S)
+    first, step = int(start_s / ONSET_HOP_S), max(1, int(step_s / ONSET_HOP_S))
+    return [_autocorr(o[a:a + W], l0, l1, 2) for a in range(first, len(o) - W, step)]
+
+
+def split_segments(sigs, k, min_len):
+    """Split the window sequence into k runs (each >= min_len windows) with the least spread around each run's mean
+    fingerprint (dynamic programming). Returns (the k-1 boundary indexes, cost)."""
+    n = len(sigs)
+    if k == 1 or n < k * min_len:
+        return [], None
+    d = len(sigs[0])
+    P, Q = [[0.0] * d], [0.0]
+    for v in sigs:
+        P.append([a + b for a, b in zip(P[-1], v)])
+        Q.append(Q[-1] + sum(x * x for x in v))
+
+    def sse(a, b):
+        return (Q[b] - Q[a]) - sum((y - x) ** 2 for x, y in zip(P[a], P[b])) / (b - a)
+
+    INF = float('inf')
+    cost = [[INF] * (n + 1) for _ in range(k + 1)]
+    back = [[0] * (n + 1) for _ in range(k + 1)]
+    cost[0][0] = 0.0
+    for j in range(1, k + 1):
+        for b in range(j * min_len, n + 1):
+            for a in range((j - 1) * min_len, b - min_len + 1):
+                if cost[j - 1][a] < INF:
+                    c = cost[j - 1][a] + sse(a, b)
+                    if c < cost[j][b]:
+                        cost[j][b], back[j][b] = c, a
+    bounds, b = [], n
+    for j in range(k, 0, -1):
+        b = back[j][b]
+        bounds.append(b)
+    return sorted(bounds)[1:], cost[k][n]
+
+
+def tempo_ratio(o, a_s, b_s, c_s, lag_min=0.15, lag_max=1.6):
+    """How much faster [b_s, c_s) is than [a_s, b_s): the time scale that best maps the first stretch's
+    autocorrelation onto the second's."""
+    l0, l1 = int(lag_min / ONSET_HOP_S), int(lag_max / ONSET_HOP_S)
+    h = ONSET_HOP_S
+    r1 = _autocorr(o[int(a_s / h):int(b_s / h)], l0, l1)
+    r2 = _autocorr(o[int(b_s / h):int(c_s / h)], l0, l1)
+    best = (-2.0, 1.0)
+    for s100 in range(90, 222, 2):
+        s = s100 / 100
+        num = d1 = d2 = 0.0
+        for j, v in enumerate(r1):
+            x = (j + l0) / s - l0
+            i = int(x)
+            if 0 <= i < len(r2) - 1:
+                w = r2[i] + (x - i) * (r2[i + 1] - r2[i])
+                num, d1, d2 = num + v * w, d1 + v * v, d2 + w * w
+        c = num / ((d1 * d2) ** 0.5 or 1.0)
+        if c > best[0]:
+            best = (c, s)
+    return best[1]
+
+
+def propose_play_starts(o, play1_ms, max_plays=MAX_PROPOSED_PLAYS):
+    """Start of each play in ms (play 1 first): split into max_plays by rhythm, merge neighbours that are not clearly
+    faster, split again with that many, move each change PLAY_LEAD_S earlier, round to 0.1 s."""
+    start = play1_ms / 1000
+    sigs = rhythm_signatures(o, start)
+    min_len = int(PLAY_MIN_S / PLAY_STEP_S)
+    end = len(o) * ONSET_HOP_S
+
+    def times(k):
+        bounds, _ = split_segments(sigs, k, min_len)
+        return [start + b * PLAY_STEP_S + PLAY_WIN_S / 2 - PLAY_LEAD_S for b in bounds]
+
+    k = max_plays
+    while k > 1:
+        t = times(k)
+        if len(t) < k - 1:
+            k -= 1
+            continue
+        edges = [start] + t + [end]
+        if all(tempo_ratio(o, edges[i], edges[i + 1], edges[i + 2]) >= PLAY_MIN_SPEEDUP for i in range(k - 1)):
+            break
+        k -= 1
+    starts = [start] + (times(k) if k > 1 else [])
+    return [int(round(x * 10)) * 100 for x in starts]
 
 
 # ---------------------------------------------------------------- MP3 frames
@@ -620,7 +758,6 @@ class Tune:
     icon: str = DEFAULT_ICON
     colour: int = None
     marker_file: Path = None
-    proposal_ms: int = None
 
 
 def scan(recordings_dir):
@@ -711,9 +848,6 @@ def write_card(image, tune_count, wipe):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='sync-tunes', description=__doc__.split('\n\n')[0])
-    ap.add_argument('--accept', action='append', default=[], metavar='TITLE',
-                    help='write the proposed marker file for TITLE (only if it does not exist); repeatable')
-    ap.add_argument('--accept-all', action='store_true', help='write every proposed marker file that does not exist')
     ap.add_argument('--no-flash', action='store_true', help='do everything except writing to the board')
     ap.add_argument('--built-in', action='store_true',
                     help=f'write the built-in flash `tunes` partition ({FLASH_BITRATE_KBPS} kbps) instead of the SD '
@@ -748,13 +882,8 @@ def main(argv=None):
     icons = load_icons()
     marker_files = find_marker_files(MARKERS)
     keys = {tune_key(t.title) for t in tunes}
-    accept = {tune_key(a) for a in args.accept}
-    unknown = accept - keys
-    if unknown:
-        raise SyncError(f'--accept: no recording called {", ".join(sorted(unknown))}')
     today = datetime.date.today().isoformat()
-    interactive = sys.stdin.isatty() and not (args.accept or args.accept_all)
-    pending = []
+    new_markers = []
     for t in tunes:
         key = tune_key(t.title)
         duration_ms = t.stream.total_samples * 1000 // SAMPLE_RATE
@@ -766,22 +895,17 @@ def main(argv=None):
             t.icon = tf.icon or DEFAULT_ICON
             t.colour = tf.colour
             continue
-        t.proposal_ms = propose_play1_start(loudness_envelope(t.src))
         t.markers_ms = []
-        if t.proposal_ms is None:
-            print(f'markers: "{t.title}": no sustained sound found; no proposal')
+        play1 = propose_play1_start(loudness_envelope(t.src))
+        if play1 is None:
+            print(f'markers: "{t.title}": no sustained sound found; it will play from 0:00 (set starts: ./mark)')
             continue
+        print(f'markers: "{t.title}": new recording, finding where each play starts...', flush=True)
+        starts = [ms for ms in propose_play_starts(onset_strength(t.src), play1) if ms < duration_ms]
         path = MARKERS / f'{t.title}.txt'
-        write = args.accept_all or key in accept
-        if interactive:
-            write = input(f'markers: "{t.title}": play 1 starts at {format_time_ms(t.proposal_ms)}. '
-                          f'Write markers/{path.name}? [y/N] ').strip().lower() == 'y'
-        if write:
-            write_new_file(path, marker_file_text(t.title, [t.proposal_ms], today))
-            t.marker_file, t.markers_ms = path, [t.proposal_ms]
-            print(f'markers: wrote markers/{path.name} (play 1 at {format_time_ms(t.proposal_ms)})')
-        else:
-            pending.append(t)
+        write_new_file(path, marker_file_text(t.title, starts, today))
+        t.marker_file, t.markers_ms = path, starts
+        new_markers.append(t)
     orphans = sorted(p.name for k, p in marker_files.items() if k not in keys)
 
     # 3. index + size check
@@ -867,11 +991,11 @@ def main(argv=None):
     else:
         print(f'space: {mb(used)} used of {mb(capacity)}, {mb(capacity - used)} left '
               f'(~{minutes_at_bitrate(capacity - used, kbps):.0f} min at {kbps} kbps)')
-    if pending:
-        print('\nmarkers: proposals NOT written (no marker file yet). Check them, then run '
-              './sync-tunes --accept "<title>" (or --accept-all):')
-        for t in pending:
-            print(f'  play 1 at {format_time_ms(t.proposal_ms)}  {t.title}')
+    if new_markers:
+        print('\nmarkers: new recordings got their play starts guessed (written to markers/). On the board, tap each '
+              'speed on the ring and listen; if one starts in the wrong place: ./mark "<title>", then ./sync-tunes')
+        for t in new_markers:
+            print(f'  {", ".join(format_time_ms(m) for m in t.markers_ms):<24} {t.title}')
     if orphans:
         print(f'\nmarkers: no recording for: {", ".join(orphans)}')
     return 0
