@@ -1,0 +1,4 @@
+# Start time of each play of "Jim Ward's Jig" (m:ss.s), one per line, slow to fast.
+# Guessed by sync-tunes on 2026-11-26. Check each speed on the board; fix with ./mark "Jim Ward's Jig".
+0:07.9
+2:21.9

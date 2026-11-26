@@ -1,0 +1,3 @@
+# Start time of each play of "Humours of Tulla" (m:ss.s), one per line, slow to fast.
+# Guessed by sync-tunes on 2026-11-26. Check each speed on the board; fix with ./mark "Humours of Tulla".
+0:02.9
