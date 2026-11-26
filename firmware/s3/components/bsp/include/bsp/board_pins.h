@@ -44,3 +44,12 @@
 #define BSP_BATT_ADC_UNIT    ADC_UNIT_1
 #define BSP_BATT_ADC_CHANNEL ADC_CHANNEL_0
 #define BSP_BATT_DIVIDER     2
+
+// micro-SD (TF card): SDMMC 4-bit, no card-detect pin (D3 doubles as CD). SCH p2/p4, vendor 02_SD_Card sdcard_bsp.c:15-20.
+// Verified 2026-11-15/16: a card answers on these pins and its FAT32 volume reads correctly (docs/hardware.md log).
+#define BSP_SD_PIN_CLK       GPIO_NUM_4
+#define BSP_SD_PIN_CMD       GPIO_NUM_3
+#define BSP_SD_PIN_D0        GPIO_NUM_5
+#define BSP_SD_PIN_D1        GPIO_NUM_6
+#define BSP_SD_PIN_D2        GPIO_NUM_42
+#define BSP_SD_PIN_D3        GPIO_NUM_2

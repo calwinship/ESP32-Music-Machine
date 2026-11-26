@@ -3,7 +3,7 @@
 # with them titles show fadas (ui_fonts.h).
 file(GLOB FONT_SRCS "${CMAKE_CURRENT_LIST_DIR}/fonts/font_*.c")
 idf_component_register(
-    SRCS "main.c" "player_task.c" "settings.c" "ui.c" ${FONT_SRCS}
+    SRCS "main.c" "player_task.c" "settings.c" "ui.c" "link_task.c" ${FONT_SRCS}
     INCLUDE_DIRS "."
     PRIV_REQUIRES bsp logic nvs_flash)
 if(FONT_SRCS)

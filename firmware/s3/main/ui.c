@@ -1016,3 +1016,34 @@ void ui_start(int32_t volume)
     ESP_LOGI(TAG, "fonts: %s", UI_FOLD_ACCENTS ? "built-in ASCII (accents folded; run tools/gen_fonts.sh)"
                                                 : "Latin-1 (fadas)");
 }
+
+// ---- sync mode screen (./sync-tunes writing the SD card): nothing else runs --------------------------------------
+static lv_obj_t *s_sync_pct;
+
+void ui_sync_start(void)
+{
+    if (!bsp_display_lock(-1)) {
+        return;
+    }
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, COL_BG, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_label_set_text(label(scr, UI_FONT_TEXT, COL_ACCENT, -30), "Syncing tunes");
+    s_sync_pct = label(scr, UI_FONT_TEXT, COL_TEXT, 10);
+    lv_label_set_text(label(scr, UI_FONT_SMALL, COL_DIM, 60), "Keep the cable plugged in");
+    bsp_display_unlock();
+    bsp_backlight_fade_in(FADE_IN_MS);
+}
+
+void ui_sync_progress(int percent)
+{
+    if (!s_sync_pct || !bsp_display_lock(100)) {
+        return;
+    }
+    if (percent < 0) {
+        lv_label_set_text(s_sync_pct, "");
+    } else {
+        lv_label_set_text_fmt(s_sync_pct, "%d%%", percent);
+    }
+    bsp_display_unlock();
+}

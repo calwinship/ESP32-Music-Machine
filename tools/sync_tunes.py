@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Convert recordings/ to device tunes, write INDEX.BIN, build a FAT image and write ONLY the S3's `tunes` partition.
+"""Convert recordings/ to device tunes, write INDEX.BIN, build a FAT image and write it to the board's SD card
+(default) or, with --built-in, to ONLY the S3's `tunes` flash partition.
 
 Run through ./sync-tunes (IDF Python env). Steps:
   1. recordings/*.m4a -> title (file name, trimmed, NFC) and a stable tune ID (FNV-1a of the normalised title).
@@ -8,9 +9,14 @@ Run through ./sync-tunes (IDF Python env). Steps:
   3. markers/<title>.txt (git-tracked) gives the start time of each play. Missing file -> propose play 1's start and
      print it; a file is written only with --accept / --accept-all (or a y/n prompt in a terminal), never over an
      existing file.
-  4. Size check against the `tunes` partition in firmware/s3/partitions.csv; refuse if it doesn't fit.
-  5. IDF fatfsgen.py -> raw FAT image; parttool.py writes it to the `tunes` partition of the board (port from
-     tools/monitor.py --print-port, which accepts only the ESP32-S3).
+  4. Size check: SD card -> a FAT16 volume just big enough for the files (checked against the card the board reports);
+     --built-in -> the `tunes` partition in firmware/s3/partitions.csv. Refuse if it doesn't fit.
+  5. IDF fatfsgen.py -> raw FAT image.
+     SD card: tools/board_link.py asks the running firmware to restart into sync mode, sends the image in checksummed
+     pieces (the board writes, reads back and compares each), with sector 0 cleared first and written last so an
+     interrupted sync never leaves a half-valid card; then the board restarts as the player and must report N tunes
+     from the SD card. A card that does not hold tunes yet is only erased with --wipe-card.
+     --built-in: parttool.py writes the `tunes` partition (port from tools/monitor.py --print-port, ESP32-S3 only).
 
 Only the Python standard library is used here, so tests/host/test_sync_tunes.py runs with any python3.
 """
@@ -25,6 +31,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 import unicodedata
 import zlib
 from dataclasses import dataclass, field
@@ -41,8 +48,10 @@ DEFAULT_ICON = 'music'
 RECORDING_EXTS = ('.m4a',)
 
 # Tune format, chosen 2026-11-15 by listening test: MP3 CBR, mono, 32 kHz (a DAC rate verified on the board).
-# The bitrate is the only knob: 32 kbps fits the flash partition; 48 kbps (same decoder, same firmware) for an SD card.
-BITRATE_KBPS = 32
+# The bitrate is the only knob (same decoder, same firmware): SD card 96 kbps (blind test 2026-11-25 ranked
+# 96 > 64 > 48 > 32, "all pretty much the same"); built-in flash 32 kbps, which is what fits the partition.
+SD_BITRATE_KBPS = 96
+FLASH_BITRATE_KBPS = 32
 SAMPLE_RATE = 32000
 CHANNELS = 1
 
@@ -50,7 +59,9 @@ MP3_DECODER_DELAY = 529     # samples every MP3 decoder adds on top of the LAME 
 MAX_MARKERS = 8
 MAX_TITLE_BYTES = 100
 SECTOR = 4096               # FAT sector = flash sector, as IDF's fatfs_create_rawflash_image uses
+SD_SECTOR = 512             # FAT sector on the SD card = the card's sector (FatFs needs them equal)
 ROOT_ENTRIES = 512          # fatfsgen default
+FAT12_MAX_CLUSTERS = 4085   # FatFs: <= this many clusters is FAT12
 
 INDEX_MAGIC = b'TIDX'
 INDEX_VERSION = 2
@@ -481,14 +492,86 @@ def partition_size(csv_path, name):
     return p.size
 
 
-def fat_data_bytes(part_bytes, sector=SECTOR, fat_count=2, root_entries=ROOT_ENTRIES):
+def fat_data_bytes(part_bytes, sector=SECTOR, fat_count=2, root_entries=ROOT_ENTRIES, sectors_per_cluster=1):
     """Bytes available for file data in a fatfsgen image: total minus boot sector, FATs and root directory."""
     total = part_bytes // sector
     root = math.ceil(root_entries * 32 / sector)
-    clusters = total - 1 - root
-    fat_bytes = math.ceil((clusters + 2) * 1.5) if clusters < 4085 else (clusters + 2) * 2
+    clusters = (total - 1 - root) // sectors_per_cluster
+    fat_bytes = math.ceil((clusters + 2) * 1.5) if clusters < FAT12_MAX_CLUSTERS else (clusters + 2) * 2
     fats = fat_count * math.ceil(fat_bytes / sector)
-    return (total - 1 - root - fats) * sector
+    return (total - 1 - root - fats) // sectors_per_cluster * sectors_per_cluster * sector
+
+
+FAT16_MIN_CLUSTERS = 4400   # FatFs: more than 4085 data clusters = FAT16; stay well clear of the edge
+FAT16_MAX_CLUSTERS = 65000  # FatFs: at most 65525
+
+
+def sd_layout(file_sizes, sector=SD_SECTOR):
+    """(data clusters, sectors per cluster) of a FAT16 volume just big enough for these files plus 1% (at least
+    1 MB): the smallest cluster size that stays inside FAT16."""
+    for spc in (1, 2, 4, 8, 16, 32, 64):
+        cluster = spc * sector
+        need = sum(math.ceil(n / cluster) for n in file_sizes)
+        clusters = max(need + max(need // 100, math.ceil((1 << 20) / cluster)), FAT16_MIN_CLUSTERS)
+        if clusters <= FAT16_MAX_CLUSTERS:
+            return clusters, spc
+    raise SyncError(f'{mb(sum(file_sizes))} of tunes is more than a FAT16 volume (2 GB) can hold')
+
+
+def _dos_name(name):
+    base, _, ext = name.upper().partition('.')
+    if not (1 <= len(base) <= 8 and len(ext) <= 3 and re.fullmatch(r'[A-Z0-9_]+', base + ext or '_')):
+        raise ValueError(f'not an 8.3 name: {name!r}')
+    return (base.ljust(8) + ext.ljust(3)).encode('ascii')
+
+
+def fat16_image(files, clusters, spc, when=None, volume_id=0x54554E45, sector=SD_SECTOR, root_entries=ROOT_ENTRIES):
+    """A FAT16 volume (no partition table) holding `files` [(8.3 name, bytes)] in the root directory, each stored
+    contiguously. fatfsgen cannot be used for the card: it sizes the FAT from the total sector count, so with
+    512-byte sectors (which FatFs needs on an SD card) it stops at about 32 MB."""
+    when = when or datetime.datetime.now()
+    dos_date = ((when.year - 1980) << 9) | (when.month << 5) | when.day
+    dos_time = (when.hour << 11) | (when.minute << 5) | (when.second // 2)
+    fat_sectors = math.ceil((clusters + 2) * 2 / sector)
+    root_sectors = math.ceil(root_entries * 32 / sector)
+    data_start = 1 + 2 * fat_sectors + root_sectors
+    total = data_start + clusters * spc
+    if len(files) + 1 > root_entries:
+        raise SyncError(f'{len(files)} files: the root directory holds {root_entries - 1}')
+
+    boot = bytearray(sector)
+    boot[0:3] = b'\xEB\x3C\x90'
+    boot[3:11] = b'MSDOS5.0'
+    struct.pack_into('<HBHBHHBHHHII', boot, 11, sector, spc, 1, 2, root_entries, total if total < 0x10000 else 0,
+                     0xF8, fat_sectors, 63, 255, 0, total if total >= 0x10000 else 0)
+    struct.pack_into('<BBBI11s8s', boot, 36, 0x80, 0, 0x29, volume_id, b'TUNES      ', b'FAT16   ')
+    boot[510:512] = b'\x55\xAA'
+
+    fat = bytearray(fat_sectors * sector)
+    struct.pack_into('<HH', fat, 0, 0xFFF8, 0xFFFF)
+    root = bytearray(root_sectors * sector)
+    root[0:11] = b'TUNES      '
+    root[11] = 0x08                                   # volume label
+    struct.pack_into('<HH', root, 22, dos_time, dos_date)
+    data = bytearray(clusters * spc * sector)
+    cluster_bytes = spc * sector
+    nxt = 2
+    for i, (name, content) in enumerate(files, 1):
+        n = math.ceil(len(content) / cluster_bytes)
+        if nxt - 2 + n > clusters:
+            raise SyncError('the files do not fit the volume')
+        first = nxt if n else 0
+        for c in range(nxt, nxt + n):
+            struct.pack_into('<H', fat, 2 * c, c + 1 if c < nxt + n - 1 else 0xFFFF)
+        off = (nxt - 2) * cluster_bytes
+        data[off:off + len(content)] = content
+        e = 32 * i
+        root[e:e + 11] = _dos_name(name)
+        root[e + 11] = 0x20                           # archive
+        struct.pack_into('<HHHHHHHI', root, e + 14, dos_time, dos_date, dos_date, 0, dos_time, dos_date, first,
+                         len(content))
+        nxt += n
+    return bytes(boot + fat + fat + root + data)
 
 
 def on_disk(nbytes, sector=SECTOR):
@@ -509,9 +592,9 @@ def source_duration_s(path):
                       str(path)]).strip())
 
 
-def encode(src, cache_dir):
+def encode(src, cache_dir, bitrate_kbps=FLASH_BITRATE_KBPS):
     """recording -> MP3 bytes (cached by content + settings)."""
-    settings = f'mp3 cbr {BITRATE_KBPS}k {SAMPLE_RATE}Hz {CHANNELS}ch v1'
+    settings = f'mp3 cbr {bitrate_kbps}k {SAMPLE_RATE}Hz {CHANNELS}ch v1'
     h = hashlib.sha256(settings.encode())
     with open(src, 'rb') as f:
         for chunk in iter(lambda: f.read(1 << 20), b''):
@@ -521,7 +604,7 @@ def encode(src, cache_dir):
         cache_dir.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix('.tmp.mp3')
         run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src), '-vn', '-ac', str(CHANNELS),
-             '-ar', str(SAMPLE_RATE), '-c:a', 'libmp3lame', '-b:a', f'{BITRATE_KBPS}k',
+             '-ar', str(SAMPLE_RATE), '-c:a', 'libmp3lame', '-b:a', f'{bitrate_kbps}k',
              '-id3v2_version', '0', '-write_id3v1', '0', '-map_metadata', '-1', str(tmp)])
         tmp.rename(out)
     return out.read_bytes()
@@ -569,8 +652,59 @@ def mb(n):
     return f'{n / 1e6:.2f} MB'
 
 
-def minutes_at_bitrate(nbytes):
-    return nbytes / (BITRATE_KBPS * 1000 / 8) / 60
+def minutes_at_bitrate(nbytes, kbps):
+    return nbytes / (kbps * 1000 / 8) / 60
+
+
+def write_card(image, tune_count, wipe):
+    """Write a FAT image to the board's SD card through the running firmware (tools/board_link.py); see step 5."""
+    import monitor  # pyserial: only inside the IDF env
+    import board_link as bl
+    link = bl.Link(monitor)
+    try:
+        port = link.open()
+        inf = link.info()
+        if inf.version != bl.VERSION:
+            raise SyncError(f'board firmware speaks link version {inf.version}, this script {bl.VERSION}: run ./flash')
+        if not inf.card_sectors:
+            raise SyncError('the board found no SD card. To use the built-in storage instead: ./sync-tunes --built-in')
+        card = inf.card_sectors * bl.SECTOR
+        if len(image) > card:
+            raise SyncError(f'tunes need {mb(len(image))}, the SD card holds {mb(card)}')
+        if inf.mode == bl.MODE_PLAYER and inf.source != 2 and not wipe:
+            raise SyncError('the SD card does not hold tunes yet (a new card, or the last sync was interrupted). '
+                            'Writing ERASES EVERYTHING on it. If that is OK: ./sync-tunes --wipe-card')
+        print(f'sync-tunes: writing {mb(len(image))} to the SD card ({mb(card)}) via {port}. '
+              'The board shows "Syncing tunes"; keep the cable in.')
+        if inf.mode != bl.MODE_SYNC:
+            link.restart_into('B', 'b', bl.MODE_SYNC)
+        tty = sys.stdout.isatty()
+        last = [-1]
+
+        def progress(done, total, secs):
+            pct = done * 100 // total
+            if pct != last[0] and (tty or pct % 10 == 0):
+                last[0] = pct
+                rate = done * bl.SECTOR / max(secs, 1e-3) / 1e6
+                print(f'{chr(13) if tty else ""}  {pct:3d}%  {mb(done * bl.SECTOR)}  {rate:.2f} MB/s',
+                      end='' if tty and pct < 100 else '\n', flush=True)
+
+        secs = bl.write_image(link, image, progress)
+        inf = link.restart_into('X', 'x', bl.MODE_PLAYER)
+        end = time.time() + 10   # the player loads the index a moment after the board answers
+        while inf.tune_count != tune_count and time.time() < end:
+            time.sleep(0.5)
+            inf = link.info()
+        print(f'sync-tunes: written and read back in {secs:.0f} s; the board now plays {inf.tune_count} tunes from '
+              f'the {bl.SOURCES.get(inf.source, "?")}')
+        if inf.source != 2 or inf.tune_count != tune_count:
+            raise SyncError(f'expected {tune_count} tunes from the SD card. Run ./sync-tunes again')
+        return card
+    except bl.LinkError as e:
+        raise SyncError(f'{e}. Nothing is lost: run ./sync-tunes again (until then the board plays its built-in '
+                        'tunes)') from None
+    finally:
+        link.close()
 
 
 # ---------------------------------------------------------------- main
@@ -581,6 +715,11 @@ def main(argv=None):
                     help='write the proposed marker file for TITLE (only if it does not exist); repeatable')
     ap.add_argument('--accept-all', action='store_true', help='write every proposed marker file that does not exist')
     ap.add_argument('--no-flash', action='store_true', help='do everything except writing to the board')
+    ap.add_argument('--built-in', action='store_true',
+                    help=f'write the built-in flash `tunes` partition ({FLASH_BITRATE_KBPS} kbps) instead of the SD '
+                         f'card ({SD_BITRATE_KBPS} kbps)')
+    ap.add_argument('--wipe-card', action='store_true',
+                    help='allow erasing an SD card that does not hold tunes yet (a new card)')
     ap.add_argument('--write-test-fixture', metavar='PATH', help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
@@ -588,6 +727,8 @@ def main(argv=None):
         Path(args.write_test_fixture).write_bytes(write_index(fixture_tunes()))
         return 0
 
+    to_card = not args.built_in
+    kbps = SD_BITRATE_KBPS if to_card else FLASH_BITRATE_KBPS
     tunes, ignored = scan(RECORDINGS)
     if not tunes:
         raise SyncError(f'no {"/".join(RECORDING_EXTS)} files in {RECORDINGS}')
@@ -596,8 +737,8 @@ def main(argv=None):
 
     # 1. encode + parse
     for t in tunes:
-        t.stream = parse_mp3(encode(t.src, BUILD / 'cache'))
-        if (t.stream.sample_rate, t.stream.channels, t.stream.bitrate_kbps) != (SAMPLE_RATE, CHANNELS, BITRATE_KBPS):
+        t.stream = parse_mp3(encode(t.src, BUILD / 'cache', kbps))
+        if (t.stream.sample_rate, t.stream.channels, t.stream.bitrate_kbps) != (SAMPLE_RATE, CHANNELS, kbps):
             raise SyncError(f'{t.title}: encoder produced an unexpected format')
         src_s, got_s = source_duration_s(t.src), t.stream.total_samples / SAMPLE_RATE
         if abs(src_s - got_s) > 0.05:
@@ -643,7 +784,7 @@ def main(argv=None):
             pending.append(t)
     orphans = sorted(p.name for k, p in marker_files.items() if k not in keys)
 
-    # 3. size check
+    # 3. index + size check
     files = [(f'T{i:02d}.MP3', t) for i, t in enumerate(tunes, 1)]
     index = write_index([IndexTune(t.tune_id, t.title, name, SAMPLE_RATE, CHANNELS, t.stream.total_samples,
                                    len(t.stream.audio), t.stream.delay, MP3_SAMPLES_PER_FRAME, t.markers_ms,
@@ -651,18 +792,23 @@ def main(argv=None):
                                    t.colour if t.colour is not None else default_colour(t.tune_id))
                       for name, t in files])
     read_index(index)  # self-check
-    part = partition_size(PARTITIONS_CSV, PARTITION_NAME)
-    capacity = fat_data_bytes(part)
-    used = sum(on_disk(len(t.stream.audio)) for _, t in files) + on_disk(len(index))
     total_min = sum(t.stream.total_samples for t in tunes) / SAMPLE_RATE / 60
-    if used > capacity:
-        print(f'sync-tunes: REFUSED, nothing written. {len(tunes)} tunes ({total_min:.1f} min) need {mb(used)}; '
-              f'the {PARTITION_NAME} partition holds {mb(capacity)}.')
-        print(f'  Over by {mb(used - capacity)} (~{minutes_at_bitrate(used - capacity):.1f} min at {BITRATE_KBPS} kbps). '
-              'Move recordings out of recordings/ until it fits. Sizes:')
-        for _, t in sorted(files, key=lambda f: -len(f[1].stream.audio)):
-            print(f'    {mb(on_disk(len(t.stream.audio)))}  {t.title}')
-        return 2
+    if to_card:
+        clusters, spc = sd_layout([len(t.stream.audio) for _, t in files] + [len(index)])
+        where = 'the SD card'
+    else:
+        part = partition_size(PARTITIONS_CSV, PARTITION_NAME)
+        where = f'the built-in "{PARTITION_NAME}" partition'
+        capacity = fat_data_bytes(part)
+        used = sum(on_disk(len(t.stream.audio)) for _, t in files) + on_disk(len(index))
+        if used > capacity:
+            print(f'sync-tunes: REFUSED, nothing written. {len(tunes)} tunes ({total_min:.1f} min) need {mb(used)}; '
+                  f'the {PARTITION_NAME} partition holds {mb(capacity)}.')
+            print(f'  Over by {mb(used - capacity)} (~{minutes_at_bitrate(used - capacity, kbps):.1f} min at {kbps} '
+                  'kbps). Move recordings out of recordings/ until it fits, or use the SD card. Sizes:')
+            for _, t in sorted(files, key=lambda f: -len(f[1].stream.audio)):
+                print(f'    {mb(on_disk(len(t.stream.audio)))}  {t.title}')
+            return 2
 
     # 4. image
     stage = BUILD / 'image'
@@ -672,15 +818,24 @@ def main(argv=None):
     for name, t in files:
         (stage / name).write_bytes(t.stream.audio)
     (stage / 'INDEX.BIN').write_bytes(index)
-    image = BUILD / 'tunes.img'
-    run([sys.executable, str(Path(os.environ['IDF_PATH']) / 'components' / 'fatfs' / 'fatfsgen.py'), str(stage),
-         '--output_file', str(image), '--partition_size', str(part), '--sector_size', str(SECTOR)])
-    if image.stat().st_size != part:
-        raise SyncError(f'image is {image.stat().st_size} bytes, partition is {part}')
+    if to_card:
+        image = BUILD / 'card.img'
+        image.write_bytes(fat16_image([(name, t.stream.audio) for name, t in files] + [('INDEX.BIN', index)],
+                                      clusters, spc, volume_id=zlib.crc32(index)))
+        part = image.stat().st_size
+    else:
+        image = BUILD / 'tunes.img'
+        run([sys.executable, str(Path(os.environ['IDF_PATH']) / 'components' / 'fatfs' / 'fatfsgen.py'), str(stage),
+             '--output_file', str(image), '--partition_size', str(part), '--sector_size', str(SECTOR)])
+        if image.stat().st_size != part:
+            raise SyncError(f'image is {image.stat().st_size} bytes, partition is {part}')
 
-    # 5. flash only the tunes partition
+    # 5. write
     if args.no_flash:
         print(f'sync-tunes: --no-flash: image at {image.relative_to(ROOT)}, board not touched')
+        card = None
+    elif to_card:
+        card = write_card(image.read_bytes(), len(tunes), args.wipe_card)
     else:
         port = run([sys.executable, str(ROOT / 'tools' / 'monitor.py'), '--print-port']).strip()
         print(f'sync-tunes: writing {image.relative_to(ROOT)} to the "{PARTITION_NAME}" partition of the ESP32-S3 '
@@ -693,18 +848,25 @@ def main(argv=None):
                             '--input', str(image), '--ignore-readonly'])  # output shown: progress + hash check
         if r.returncode != 0:
             raise SyncError(f'parttool failed ({r.returncode}); the {PARTITION_NAME} partition may be incomplete, '
-                            'run ./sync-tunes again')
+                            'run ./sync-tunes --built-in again')
 
     # 6. report
-    print(f'\nsync-tunes: {len(tunes)} tunes stored ({total_min:.1f} min, MP3 {BITRATE_KBPS} kbps mono '
+    print(f'\nsync-tunes: {len(tunes)} tunes for {where} ({total_min:.1f} min, MP3 {kbps} kbps mono '
           f'{SAMPLE_RATE // 1000} kHz)')
     for name, t in files:
         marks = ', '.join(format_time_ms(m) for m in t.markers_ms) or '-'
         colour = t.colour if t.colour is not None else default_colour(t.tune_id)
         print(f'  {name}  {t.tune_id:08x}  {format_time_ms(t.stream.total_samples * 1000 // SAMPLE_RATE):>7}  '
               f'starts: {marks:<22} {t.icon:<9} #{colour:06X}  {t.title}')
-    print(f'space: {mb(used)} used of {mb(capacity)}, {mb(capacity - used)} left '
-          f'(~{minutes_at_bitrate(capacity - used):.0f} min at {BITRATE_KBPS} kbps)')
+    if to_card:
+        if card:
+            print(f'space: {mb(part)} used of the {mb(card)} card, {mb(card - part)} left '
+                  f'(~{minutes_at_bitrate(card - part, kbps) / 60:.1f} hours at {kbps} kbps)')
+        else:
+            print(f'space: {mb(part)} needed on the SD card')
+    else:
+        print(f'space: {mb(used)} used of {mb(capacity)}, {mb(capacity - used)} left '
+              f'(~{minutes_at_bitrate(capacity - used, kbps):.0f} min at {kbps} kbps)')
     if pending:
         print('\nmarkers: proposals NOT written (no marker file yet). Check them, then run '
               './sync-tunes --accept "<title>" (or --accept-all):')

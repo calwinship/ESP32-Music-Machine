@@ -1,6 +1,7 @@
 // Board support: the only code that touches ESP32-S3 peripherals. Logic lives in components/logic (host-tested).
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -50,10 +51,31 @@ uint32_t bsp_audio_underruns(void);
 // Underruns the self-test produced (0 would mean the counter cannot be trusted).
 uint32_t bsp_audio_selftest_underruns(void);
 
-// ---- storage: the `tunes` partition, read-only FAT ----------------------------------------------------------
-// Tunes are opened by path under this mount point only, so an SD card mounted here can replace the partition.
+// ---- storage: tunes, read-only FAT at BSP_TUNES_PATH: the SD card if it holds tunes, else the `tunes` partition --
+// Tunes are opened by path under this mount point only, so the player does not care which one it is.
 #define BSP_TUNES_PATH "/tunes"
+typedef enum { BSP_STORAGE_NONE = 0, BSP_STORAGE_FLASH = 1, BSP_STORAGE_SD = 2 } bsp_storage_source_t;
 esp_err_t bsp_storage_mount(void);
+bsp_storage_source_t bsp_storage_source(void);
+// Sectors (512 B) of the SD card seen by bsp_storage_mount, 0 if none answered.
+uint32_t bsp_storage_card_sectors(void);
+
+// ---- SD card, raw (sync mode only: never together with bsp_storage_mount) ---------------------------------------
+#define BSP_SD_MAX_SECTORS 64
+esp_err_t bsp_sd_init(void);
+// Card size in 512-byte sectors (from bsp_sd_init, else from bsp_storage_mount); 0 if no card.
+uint32_t bsp_sd_sectors(void);
+// Writes count (1..BSP_SD_MAX_SECTORS) sectors from a DMA-capable buffer, reads them back and compares.
+// ESP_ERR_INVALID_CRC if the read-back differs.
+esp_err_t bsp_sd_write_verified(uint32_t first, const void *data, uint32_t count);
+
+// ---- USB link to ./sync-tunes (shares the USB-Serial-JTAG port with the log console) ---------------------------
+esp_err_t bsp_link_start(void);
+// Bytes read (0 on timeout).
+int bsp_link_read(void *buf, size_t len, int timeout_ms);
+// Sends buf as one piece (len <= 4 KB); false if it could not be queued within 200 ms.
+bool bsp_link_write(const void *buf, size_t len);
+void bsp_link_flush(int timeout_ms);
 
 #ifdef __cplusplus
 }

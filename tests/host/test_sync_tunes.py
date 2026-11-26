@@ -1,5 +1,7 @@
 """Host tests for tools/sync_tunes.py (stdlib only; run by ./test). No ffmpeg, IDF or board needed."""
+import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +11,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent / 'tools'))
 import sync_tunes as st  # noqa: E402
+import board_link as bl  # noqa: E402
 
 FIXTURE = HERE / 'fixtures' / 'index_v2.bin'
 
@@ -246,6 +249,116 @@ class Space(unittest.TestCase):
         self.assertEqual(st.on_disk(1), 4096)
         self.assertEqual(st.on_disk(4096), 4096)
         self.assertEqual(st.on_disk(4097), 8192)
+
+    def test_sd_layout_stays_inside_fat16_and_fits_the_files(self):
+        for sizes in ([10], [3_000_000] * 16, [2_400_000] * 16 + [500_000], [7_000_000] * 60, [480_000_000],
+                      [1_900_000_000]):
+            clusters, spc = st.sd_layout(sizes)
+            self.assertGreaterEqual(clusters, st.FAT16_MIN_CLUSTERS)
+            self.assertLessEqual(clusters, st.FAT16_MAX_CLUSTERS)
+            cluster = spc * st.SD_SECTOR
+            need = sum(-(-n // cluster) for n in sizes)
+            self.assertGreaterEqual(clusters, need)
+            self.assertLessEqual((clusters - need) * cluster, max(sum(sizes) // 50, 3 << 20) + 4400 * cluster)
+        self.assertEqual(st.sd_layout([3_000_000] * 16)[1], 2)   # 48 MB -> 1 KB clusters
+        self.assertEqual(st.sd_layout([10])[1], 1)
+        with self.assertRaises(st.SyncError):
+            st.sd_layout([2_200_000_000])
+
+
+def read_fat16(img):
+    """Independent minimal FAT16 reader (root directory only): {name: bytes}, plus the cluster count FatFs sees."""
+    bps, spc, rsvd, nfats, nroot, tot16, _, fatsz = struct.unpack_from('<HBHBHHBH', img, 11)
+    tot = tot16 or struct.unpack_from('<I', img, 32)[0]
+    assert img[510:512] == b'\x55\xaa' and img[0] == 0xEB and img[54:62] == b'FAT16   '
+    root_secs = (nroot * 32 + bps - 1) // bps
+    clusters = (tot - (rsvd + nfats * fatsz + root_secs)) // spc
+    fat = img[rsvd * bps:(rsvd + fatsz) * bps]
+    assert fat == img[(rsvd + fatsz) * bps:(rsvd + 2 * fatsz) * bps]   # both FATs equal
+    root = img[(rsvd + nfats * fatsz) * bps:][:root_secs * bps]
+    data0 = (rsvd + nfats * fatsz + root_secs) * bps
+    files = {}
+    for e in range(0, len(root), 32):
+        ent = root[e:e + 32]
+        if ent[0] == 0:
+            break
+        if ent[11] & 0x08:
+            continue
+        name = ent[0:8].decode().rstrip() + '.' + ent[8:11].decode().rstrip()
+        c, size = struct.unpack_from('<H', ent, 26)[0], struct.unpack_from('<I', ent, 28)[0]
+        out = bytearray()
+        while 2 <= c < 0xFFF8:
+            off = data0 + (c - 2) * spc * bps
+            out += img[off:off + spc * bps]
+            c = struct.unpack_from('<H', fat, 2 * c)[0]
+        files[name.rstrip('.')] = bytes(out[:size])
+    return files, clusters, len(img) == tot * bps
+
+
+class Fat16Image(unittest.TestCase):
+    FILES = [('T01.MP3', bytes(range(256)) * 9), ('T02.MP3', b'x' * 1024), ('T03.MP3', b'\x01' * 1025),
+             ('INDEX.BIN', b'TIDX' + b'\0' * 100)]
+
+    def test_files_read_back_and_fatfs_sees_fat16(self):
+        clusters, spc = st.sd_layout([len(c) for _, c in self.FILES])
+        img = st.fat16_image(self.FILES, clusters, spc)
+        files, seen, size_ok = read_fat16(img)
+        self.assertEqual(files, dict(self.FILES))
+        self.assertEqual(seen, clusters)
+        self.assertTrue(size_ok)
+        self.assertGreater(seen, st.FAT12_MAX_CLUSTERS)
+
+    def test_bigger_clusters_and_total_over_64k_sectors(self):
+        files = [('T01.MP3', b'a' * 3_000_000), ('INDEX.BIN', b'i' * 5000)]
+        img = st.fat16_image(files, 30_000, 4)           # 30000 x 2 KB = 61 MB, more than 65535 sectors
+        got, seen, size_ok = read_fat16(img)
+        self.assertEqual(got, dict(files))
+        self.assertEqual(seen, 30_000)
+        self.assertTrue(size_ok)
+
+    def test_refuses_what_does_not_fit_or_is_not_8_3(self):
+        with self.assertRaises(st.SyncError):
+            st.fat16_image([('T01.MP3', b'a' * 3_000_000)], 4400, 1)   # 2.2 MB volume
+        with self.assertRaises(ValueError):
+            st.fat16_image([('a long name.mp3', b'a')], 4400, 1)
+
+    @unittest.skipUnless(os.environ.get('IDF_PATH'), 'needs the ESP-IDF env (. tools/idf_env.sh)')
+    def test_idf_fatfsparse_reads_it(self):
+        clusters, spc = st.sd_layout([len(c) for _, c in self.FILES])
+        with tempfile.TemporaryDirectory() as d:
+            img = Path(d) / 'card.img'
+            img.write_bytes(st.fat16_image(self.FILES, clusters, spc))
+            parser = Path(os.environ['IDF_PATH']) / 'components' / 'fatfs' / 'fatfsparse.py'
+            subprocess.run([sys.executable, str(parser), str(img)], cwd=d, check=True, capture_output=True)
+            for name, content in self.FILES:
+                # fatfsparse names its output folder after the volume label
+                self.assertEqual((Path(d) / 'TUNES' / name).read_bytes(), content, name)
+
+
+class BoardLink(unittest.TestCase):
+    # Same bytes as GOLDEN in tests/host/test_link.c (the firmware's encoder).
+    GOLDEN = bytes.fromhex('4b4c691400000001000000000000000200000000000f0010000000e2793255')
+
+    def test_encode_matches_the_firmware(self):
+        self.assertEqual(bl.encode('i', struct.pack('<5I', 1, 0, 2, 983040, 16)), self.GOLDEN)
+
+    def test_decoder_skips_log_text_and_bad_frames(self):
+        bad = bytearray(self.GOLDEN)
+        bad[10] ^= 1
+        stream = b'I (786) app: KL volume 8\r\n' + bytes(bad) + self.GOLDEN + b'W (9) KLx' + bl.encode('w', b'abc')
+        for step in (1, 5, 4096):
+            d, got = bl.Decoder(), []
+            for i in range(0, len(stream), step):
+                got += d.feed(stream[i:i + step])
+            self.assertEqual(got, [('i', self.GOLDEN[7:27]), ('w', b'abc')])
+
+    def test_write_order_ends_with_sector_0_and_covers_every_sector_once(self):
+        for n in (1, 2, 64, 65, 129, 1000):
+            pieces = bl.write_order(n)
+            self.assertEqual(pieces[-1], (0, 1))
+            covered = sorted(s for first, count in pieces for s in range(first, first + count))
+            self.assertEqual(covered, list(range(n)))
+            self.assertTrue(all(0 < c <= bl.MAX_SECTORS for _, c in pieces))
 
 
 if __name__ == '__main__':

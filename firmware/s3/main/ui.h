@@ -20,3 +20,6 @@
 #include <stdint.h>
 
 void ui_start(int32_t volume);
+// Sync mode (instead of ui_start): "Syncing tunes", a percentage (ui_sync_progress; < 0 hides it) and a hint.
+void ui_sync_start(void);
+void ui_sync_progress(int percent);

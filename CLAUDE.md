@@ -8,8 +8,10 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 - `./flash [secs]`: build + flash the **S3 only** + print boot logs (default 8 s)
 - `./logs [secs] [--reset none]`: capture logs without a TTY (resets the board unless `--reset none`)
 - `./test`: host unit tests: `components/logic` (cc + ASan/UBSan) and `tools/sync_tunes.py` (Python), no board needed
-- `./sync-tunes [--no-flash] [--accept "<title>"] [--accept-all]`: `recordings/*.m4a` → MP3 + `INDEX.BIN` → FAT image →
-  writes **only** the S3 `tunes` partition (~2–3 min). Refuses if it doesn't fit. Cache/image in gitignored `build-tunes/`
+- `./sync-tunes [--wipe-card] [--built-in] [--no-flash] [--accept "<title>"] [--accept-all]`: `recordings/*.m4a` → MP3 +
+  `INDEX.BIN` → FAT image → **SD card** (default, 96 kbps, own FAT16 builder, written through the running firmware over
+  USB: `tools/board_link.py`, ~0.3 MB/s) or, with `--built-in`, **only** the S3 `tunes` flash partition (32 kbps,
+  fatfsgen + parttool, ~2–3 min). A card without tunes is only erased with `--wipe-card`. Cache/images in `build-tunes/`
 - `. tools/idf_env.sh`: ESP-IDF shell for manual `idf.py` use
 - `tools/gen_fonts.sh`: regenerate `firmware/s3/main/fonts/` (Latin-1 text with fadas, 64 px digits, tune icons from
   `tools/icons.txt`) with `npx lv_font_conv@1.5.2`; output is committed, so only needed when glyphs change
@@ -25,17 +27,20 @@ Waveshare dual-MCU board: **ESP32-S3R8** (our app) + **ESP32-U4WDH** (factory fi
 
 ## Layout
 - `firmware/s3/main/`: app wiring and UI (thin); `player_task.c` = file -> MP3 decoder -> I2S (decisions live in logic);
-  `ui.c` = tune screen, timeline ring, paged tune list, guide (input table in `ui.h`); `settings.c` = NVS
+  `ui.c` = tune screen, timeline ring, paged tune list, guide, sync screen (input table in `ui.h`); `settings.c` = NVS;
+  `link_task.c` = USB link to sync-tunes (player mode: info + restart into sync mode; sync mode: SD writes)
+- Storage: tunes mount read-only at `/tunes` from the SD card if it holds `INDEX.BIN`, else from the `tunes` partition
 - `firmware/s3/components/bsp/`: board drivers; pins only in `include/bsp/board_pins.h`
 - `firmware/s3/components/logic/`: pure C, **no ESP-IDF headers** (knob, CST816, INDEX.BIN parser, seek maths, player
-  state, controls, battery level, `look.h` speed colours + timeline-ring geometry)
+  state, controls, battery level, `look.h` speed colours + timeline-ring geometry, `link.h` USB link frames + CRC)
 - `tests/host/`: tests for `logic` (incl. vendor knob equivalence; INDEX.BIN golden fixture shared with Python) and `sync_tunes.py`
 - `tools/monitor.py`: serial capture; survives USB re-enumeration; `--print-port` gives the S3 port only
 - `recordings/`: the user's `.m4a` memos (gitignored; file name = title). `recordings/not-synced/` is ignored by sync
 - `markers/<title>.txt` (git-tracked): start time of each play. sync-tunes only creates missing files, after the user
   confirms (`--accept`); **never overwrite or edit one without asking.** Format: `markers/README.md`
 - `markers/` files may also set `icon:` (name from `tools/icons.txt`) and `colour: #RRGGBB`; both go into INDEX.BIN v2
-- Tunes: MP3 CBR 32 kbps mono 32 kHz (user's listening test, 2026-11-15); tune ID = FNV-1a of the normalised title
+- Tunes: MP3 CBR mono 32 kHz (listening test 2026-11-15); 96 kbps on the SD card (blind test 2026-11-25), 32 kbps in
+  flash (what fits); tune ID = FNV-1a of the normalised title
 - `docs/backups.md`: factory S3 flash backup checksum (file in `~/esp/backups/`, outside git)
 
 ## Rules
