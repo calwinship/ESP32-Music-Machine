@@ -43,8 +43,6 @@ esp_err_t bsp_sd_init(void)
         sdmmc_host_deinit();
         return err;
     }
-    s_verify = heap_caps_malloc(BSP_SD_MAX_SECTORS * 512, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    ESP_RETURN_ON_FALSE(s_verify, ESP_ERR_NO_MEM, TAG, "verify buffer");
     s_ready = true;
     ESP_LOGI(TAG, "card %s: %u sectors (%u MB)", s_card.cid.name, (unsigned)s_card.csd.capacity,
              (unsigned)((uint64_t)s_card.csd.capacity * 512 / (1024 * 1024)));
@@ -61,6 +59,10 @@ esp_err_t bsp_sd_write_verified(uint32_t first, const void *data, uint32_t count
     ESP_RETURN_ON_FALSE(s_ready, ESP_ERR_INVALID_STATE, TAG, "card not initialised");
     ESP_RETURN_ON_FALSE(count && count <= BSP_SD_MAX_SECTORS, ESP_ERR_INVALID_ARG, TAG, "count %u", (unsigned)count);
     ESP_RETURN_ON_FALSE((uint64_t)first + count <= s_card.csd.capacity, ESP_ERR_INVALID_SIZE, TAG, "past the end");
+    if (!s_verify) {   // only sync mode writes, so only it pays for the read-back buffer
+        s_verify = heap_caps_malloc(BSP_SD_MAX_SECTORS * 512, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        ESP_RETURN_ON_FALSE(s_verify, ESP_ERR_NO_MEM, TAG, "verify buffer");
+    }
     ESP_RETURN_ON_ERROR(sdmmc_write_sectors(&s_card, data, first, count), TAG, "write %u+%u", (unsigned)first,
                         (unsigned)count);
     ESP_RETURN_ON_ERROR(sdmmc_read_sectors(&s_card, s_verify, first, count), TAG, "read back");

@@ -31,7 +31,12 @@ static bool mount_sd(void)
         s_card_sectors = (uint32_t)card->csd.capacity;
     }
     if (err != ESP_OK) {
-        ESP_LOGI(TAG, "SD card: %s (%s)", card ? "no tunes volume" : "none", esp_err_to_name(err));
+        // A failed mount frees the card handle and the host, so ask the card itself whether it is there: a card with
+        // no volume (new, or from an interrupted sync) must still be reported, or ./sync-tunes could not write it.
+        if (!card && bsp_sd_init() == ESP_OK) {
+            s_card_sectors = bsp_sd_sectors();
+        }
+        ESP_LOGI(TAG, "SD card: %s (%s)", s_card_sectors ? "no tunes volume" : "none", esp_err_to_name(err));
         return false;
     }
     struct stat st;
